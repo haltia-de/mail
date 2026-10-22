@@ -5,7 +5,8 @@
 # plain text with its attachments; a new letter with files goes out over
 # SMTP, and files shared from other programs start one. IMAP and SMTP run in
 # one worker thread; the password lives in haltia_kit.vault and «Выйти»
-# deletes it.
+# deletes it. Other programs (haltia-report) send a letter without a window
+# over D-Bus; «Исходящие» keep it until the network lets it go.
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import configparser
@@ -34,6 +35,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 from haltia_kit import dialogs, share
 from haltia_kit.vault import Locked, Vault
 from haltia_mail import servers, smtp
+from haltia_mail.outbox import Outbox
 from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
 from haltia_mail.letter import clean_name
 
@@ -44,6 +46,23 @@ CONFIG = os.path.join(GLib.get_user_config_dir(), "haltia", "mail.conf")
 # The vault's file when there is no keyring (the tablet): 0600, in Почта's own folder.
 FOLDER = os.path.join(GLib.get_user_data_dir(), "haltia-mail")
 CACHE = os.path.join(GLib.get_user_cache_dir(), "haltia-mail")
+# «Исходящие»: 0700, every letter's files 0600.
+OUTBOX = os.path.join(FOLDER, "outbox")
+RETRY = 600   # seconds between tries while letters wait
+# The D-Bus contract for haltia-report (AGENTS.md): Send -> queued, sent or not-configured.
+DBUS = """
+<node>
+  <interface name="io.github.haltia_de.Mail">
+    <method name="Send">
+      <arg type="s" name="to" direction="in"/>
+      <arg type="s" name="subject" direction="in"/>
+      <arg type="s" name="body" direction="in"/>
+      <arg type="as" name="attachments" direction="in"/>
+      <arg type="s" name="result" direction="out"/>
+    </method>
+  </interface>
+</node>
+"""
 SECRET = "password"
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
           "августа", "сентября", "октября", "ноября", "декабря")
@@ -210,8 +229,11 @@ class Row(Gtk.ListBoxRow):
 class Mail(Gtk.Application):
     def __init__(self):
         # Files shared from other programs come as «open»: a new letter with them.
+        # D-Bus starts it with --gapplication-service: no window, only Send.
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.window = None
+        self.box = None
+        self.dbus_ids = []
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -220,6 +242,128 @@ class Mail(Gtk.Application):
         self.back.set_enabled(False)
         self.add_action(self.back)
         self.set_accels_for_action("app.back", ["<Alt>Left", "Escape"])
+        self.worker = Worker()
+        self.vault = Vault(APP_ID, FOLDER, label="Почта")
+        self.config = read_config()
+        self.outbox = Outbox(OUTBOX)
+        self.waiting = False     # held while «Исходящие» are not empty
+        self.flushing = False
+        self.set_inactivity_timeout(10000)
+        Gio.NetworkMonitor.get_default().connect(
+            "network-changed", lambda _m, up: up and self.flush())
+        GLib.timeout_add_seconds(RETRY, lambda: self.flush() or True)
+        self.flush()
+
+    # Sending without a window (D-Bus) and «Исходящие»
+
+    def do_dbus_register(self, connection, path):
+        if not Gtk.Application.do_dbus_register(self, connection, path):
+            return False
+        interface = Gio.DBusNodeInfo.new_for_xml(DBUS).interfaces[0]
+        self.dbus_ids.append((connection, connection.register_object(
+            path, interface, self.dbus_call, None, None)))
+        return True
+
+    def do_dbus_unregister(self, connection, path):
+        for conn, number in list(self.dbus_ids):
+            if conn == connection:
+                connection.unregister_object(number)
+                self.dbus_ids.remove((conn, number))
+        Gtk.Application.do_dbus_unregister(self, connection, path)
+
+    def account(self):
+        """(address, provider) of the saved mailbox, or None."""
+        section = self.config["mail"]
+        address = section.get("address", "")
+        provider = servers.servers(address) or servers.from_field(section.get("imap", ""))
+        return (address, provider) if address and provider else None
+
+    def dbus_call(self, _conn, _sender, _path, _interface, method, params, invocation):
+        if method != "Send":
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
+            return
+        to, subject, body, paths = params.unpack()
+        account = self.account()
+        if account is None:
+            invocation.return_value(GLib.Variant("(s)", ("not-configured",)))
+            return
+        self.hold()   # the service stays until it answers
+        address, provider = account
+
+        def work():
+            try:
+                password = self.vault.get(SECRET)
+                if not password:
+                    return "not-configured", len(self.outbox.names())
+            except Locked:
+                password = None   # the letter waits until the keyring opens
+            name = self.outbox.put(to, subject, body, paths)
+            if password:
+                self.send_outbox(address, password, provider)
+            waiting = self.outbox.names()
+            return ("queued" if name in waiting else "sent"), len(waiting)
+
+        def done(answer):
+            result, waiting = answer
+            invocation.return_value(GLib.Variant("(s)", (result,)))
+            self.waiting_changed(waiting)
+            self.release()
+
+        def failed(e):
+            if isinstance(e, ValueError):
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", str(e))
+            else:
+                # A disk or keyring error: never the password.
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed",
+                                             str(e) or type(e).__name__)
+            self.release()
+
+        self.worker.do(work, done, failed)
+
+    def send_outbox(self, address, password, provider):
+        """The waiting letters, on the worker thread; each one sent gets a copy
+        in «Отправленные»."""
+        box = Mailbox(address, password, provider.imap, CACHE)
+        try:
+            self.outbox.flush(address, password, provider.smtp, keep=box.save_sent)
+        finally:
+            box.close()
+
+    def flush(self):
+        """Another try for «Исходящие»: on start, when the network changes and
+        every 10 minutes."""
+        account = self.account()
+        if self.flushing or account is None:
+            return
+        self.flushing = True
+        address, provider = account
+
+        def work():
+            if self.outbox.names():
+                try:
+                    password = self.vault.get(SECRET)
+                except Locked:
+                    password = None
+                if password:
+                    self.send_outbox(address, password, provider)
+            return len(self.outbox.names())
+
+        def done(waiting):
+            self.flushing = False
+            self.waiting_changed(waiting)
+
+        def failed(_e):
+            self.flushing = False
+
+        self.worker.do(work, done, failed)
+
+    def waiting_changed(self, waiting):
+        """Holds the program (and the service) while letters wait."""
+        if waiting and not self.waiting:
+            self.hold()
+        elif not waiting and self.waiting:
+            self.release()
+        self.waiting = bool(waiting)
 
     def do_activate(self):
         if self.window is None:
@@ -241,10 +385,6 @@ class Mail(Gtk.Application):
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.worker = Worker()
-        self.vault = Vault(APP_ID, FOLDER, label="Почта")
-        self.config = read_config()
-        self.box = None
         self.role = INBOX
         self.gen = 0
         self.loaded = self.total = 0
@@ -439,8 +579,11 @@ class Mail(Gtk.Application):
 
     def sign_out(self):
         address = self.box.address if self.box else ""
-        if not dialogs.ask(self.window, "Выйти из почты %s? Пароль приложения будет "
-                           "удалён, письма на сервере останутся." % address, "Выйти"):
+        question = ("Выйти из почты %s? Пароль приложения будет удалён, письма на "
+                    "сервере останутся." % address)
+        if self.waiting:
+            question += " Неотправленные письма из «Исходящих» тоже удалятся."
+        if not dialogs.ask(self.window, question, "Выйти"):
             return
         box, self.box = self.box, None
         self.gen += 1
@@ -455,7 +598,9 @@ class Mail(Gtk.Application):
             if safe:
                 shutil.rmtree(os.path.join(CACHE, safe), ignore_errors=True)
             shutil.rmtree(os.path.join(CACHE, "files"), ignore_errors=True)
+            self.outbox.clear()
 
+        self.waiting_changed(0)
         self.worker.do(work, lambda _r: None,
                        lambda e: dialogs.info(self.window, error_text(e)))
         self.signin_status.set_text("")

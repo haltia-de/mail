@@ -30,17 +30,45 @@ ADR 0005). Follow them; this file only adds what is particular to Почта.
 - The header follows the shell's contract: 104 px, «←» bound to `app.back`
   and seen only while there is a step back.
 
+## D-Bus: sending without a window (for haltia-report)
+
+Other programs send a letter through Почта on the session bus; D-Bus starts
+it without a window (`haltia-mail --gapplication-service`, from
+`share/dbus-1/services/io.github.haltia_de.Mail.service`) when it is not
+running. Keep this contract: shell#58 (haltia-report) calls it.
+
+- Bus name `io.github.haltia_de.Mail`, object `/io/github/haltia_de/Mail`,
+  interface `io.github.haltia_de.Mail`.
+- `Send(s to, s subject, s body, as attachments) -> s`: `to` is «Кому»
+  (addresses separated by commas); `attachments` are absolute paths of
+  regular files, 20 MB together at most, copied at once (the caller may
+  delete its own after the answer). The answer:
+  - `sent`: the letter went out now (a copy goes to «Отправленные»);
+  - `queued`: it waits in «Исходящие» and goes when it can;
+  - `not-configured`: no mailbox signed in; nothing is kept.
+- A wrong address or path, a missing file or too big files:
+  `org.freedesktop.DBus.Error.InvalidArgs`; a disk error:
+  `org.freedesktop.DBus.Error.Failed`.
+- «Исходящие» live in `$XDG_DATA_HOME/haltia-mail/outbox` (0700, files
+  0600), one folder per letter, oldest sent first. They are tried again on
+  start, when the network changes (`Gio.NetworkMonitor`, NetworkManager
+  where present) and every 10 minutes; the program holds itself (stays
+  running) while letters wait. A letter the server refuses goes after
+  three days; «Выйти» deletes the waiting ones.
+
 ## Repository layout
 
 - `haltia-mail`: the GTK program.
 - `haltia_mail/`: the parts without GTK: `servers.py` (servers and hints by
   domain), `imap.py` (the mailbox, folders by special-use flags, the header
   cache, the sent letter's copy), `letter.py` (headers, HTML to text,
-  attachments), `smtp.py` (a new letter and its sending).
+  attachments), `smtp.py` (a new letter and its sending), `outbox.py`
+  («Исходящие» on disk and their sending).
 - `tests/`: unittest with in-process fake IMAP and SMTP servers
   (`fakeimap.py`, `fakesmtp.py`); `sh tests/run.sh` runs them without
   display, network or keyring.
-- `data/`: the `.desktop` file, the SVG icon, the AppStream metainfo.
+- `data/`: the `.desktop` file, the SVG icon, the AppStream metainfo, the
+  D-Bus service file (`@bindir@` is filled in by `install.sh`).
 - `install.sh`: the installer (copies files; dependencies must be present).
 - `packaging/alpine/APKBUILD`: the Alpine (postmarketOS) package.
 - `.github/workflows/release.yml`: the release through haltia-de/ci.

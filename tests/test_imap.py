@@ -132,6 +132,23 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(len(server.folders["INBOX"].letters), 0)
         self.assertEqual(len(server.folders["Trash"].letters), 1)
 
+    def test_save_sent(self):
+        raw = b"Message-ID: <1.2@ya.ru>\r\n" + letter(subject="Отчёт")
+        box = self.box()
+        self.assertTrue(box.save_sent(raw, "<1.2@ya.ru>"))
+        sent = self.server.folders["Sent"].letters
+        self.assertEqual(len(sent), 1)
+        self.assertIn("\\Seen", sent[0][1])
+        self.assertEqual(box.page(SENT, 0, 50)[0][0].subject, "Отчёт")
+
+    def test_save_sent_kept_by_the_server(self):
+        # Gmail and others put what went through their SMTP into Sent themselves.
+        raw = b"Message-ID: <1.2@ya.ru>\r\n" + letter(subject="Отчёт")
+        self.server.add("Sent", raw, seen=True)
+        self.assertTrue(self.box().save_sent(raw, "<1.2@ya.ru>"))
+        self.assertEqual(len(self.server.folders["Sent"].letters), 1)
+        self.assertFalse([c for c in self.server.commands if c.startswith("APPEND")])
+
     def test_reconnects_after_the_server_closed(self):
         self.fill(2)
         box = self.box()

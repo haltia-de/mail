@@ -4,6 +4,7 @@ summary(uid, header_bytes, flags, internal) -> Summary for the list
 read(raw) -> Letter: subject, sender, when, text, attachments
 html_to_text(html) -> plain text; links kept as «text (address)»,
     no pictures, no scripts, no styles
+clean_name(name) -> a file name without path or control characters
 """
 
 from collections import namedtuple
@@ -151,10 +152,16 @@ def _content(part):
             return payload.decode("utf-8", "replace")
 
 
-def _attachment_name(part, number):
-    name = part.get_filename() or ""
+def clean_name(name):
+    """A file's name safe to use in a folder of ours: no path, no control
+    characters, no leading dot; "" when nothing is left."""
     name = os.path.basename(_header(name).replace("\\", "/")).strip()
     name = "".join(c for c in name if c >= " " and c != "\x7f").lstrip(".")
+    return _shorten(name) if name else ""
+
+
+def _attachment_name(part, number):
+    name = clean_name(part.get_filename() or "")
     if not name:
         extension = {"application/pdf": ".pdf", "image/jpeg": ".jpg",
                      "image/png": ".png", "text/plain": ".txt"}

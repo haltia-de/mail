@@ -8,7 +8,7 @@
   <summary>One mailbox, big letters</summary>
   <summary xml:lang="ru">Один ящик, крупные письма</summary>
   <description>
-    <p xml:lang="ru">Вход по адресу и паролю приложения, сервер выбирается по адресу; Входящие, Отправленные и Корзина; письмо простым текстом, вложения можно открыть, сохранить или отправить в другую программу.</p>
+    <p xml:lang="ru">Вход по адресу и паролю приложения, сервер выбирается по адресу; Входящие, Отправленные и Корзина; письмо простым текстом, вложения можно открыть, сохранить или отправить в другую программу. Новое письмо с файлами уходит по SMTP; файл из другой программы можно отправить письмом.</p>
     <p>Calm, touch-first and simple, part of the Haltia desktop; at home on any GTK desktop.</p>
   </description>
   <launchable type="desktop-id">io.github.haltia_de.Mail.desktop</launchable>

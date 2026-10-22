@@ -4,8 +4,8 @@
 
 ### Русский
 
-Первая версия: вход по адресу и паролю приложения, Входящие, Отправленные и Корзина, вложения можно открыть, сохранить или отправить.
+Первая версия: простая почтовая программа, пока скрытая: один ящик по паролю приложения; отправка писем с вложениями; служба, которой другие программы пользуются для отправки писем, например диагностических отчётов помощника.
 
 ### English
 
-The first version: sign in with the address and an app password, read the inbox, the sent letters and the trash, open, save or send attachments.
+The first version: a simple mail program, hidden for now: one mailbox by an app password; sends letters with attachments; a service other programs use to send letters, for example the helper's diagnostic reports.

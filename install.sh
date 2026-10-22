@@ -21,3 +21,7 @@ done
 install -D -m 644 "$here/data/$id.desktop" "$share/applications/$id.desktop"
 install -D -m 644 "$here/data/$id.svg" "$share/icons/hicolor/scalable/apps/$id.svg"
 install -D -m 644 "$here/data/$id.metainfo.xml" "$share/metainfo/$id.metainfo.xml"
+# D-Bus starts Почта without a window for Send (haltia-report).
+install -d "$share/dbus-1/services"
+sed "s|@bindir@|$prefix/bin|" "$here/data/$id.service.in" > "$share/dbus-1/services/$id.service"
+chmod 644 "$share/dbus-1/services/$id.service"

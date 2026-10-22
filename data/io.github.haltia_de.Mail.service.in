@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=io.github.haltia_de.Mail
+Exec=@bindir@/haltia-mail --gapplication-service

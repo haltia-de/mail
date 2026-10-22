@@ -3,7 +3,8 @@
 # password (the servers come from the domain); then «Входящие»,
 # «Отправленные» and «Корзина», a big list loaded in pages, and a letter as
 # plain text with its attachments. IMAP runs in one worker thread; the
-# password lives in haltia_kit.vault and «Выйти» deletes it.
+# password lives in haltia_kit.vault and «Выйти» deletes it. Other programs
+# send letters with the D-Bus method Send, also without a window (AGENTS.md).
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import configparser
@@ -31,7 +32,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from haltia_kit import dialogs, share
 from haltia_kit.vault import Locked, Vault
-from haltia_mail import servers
+from haltia_mail import outbox, servers
 from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
 
 APP_ID = "io.github.haltia_de.Mail"
@@ -40,8 +41,29 @@ PAGE = 50
 CONFIG = os.path.join(GLib.get_user_config_dir(), "haltia", "mail.conf")
 # The vault's file when there is no keyring (the tablet): 0600, in Почта's own folder.
 FOLDER = os.path.join(GLib.get_user_data_dir(), "haltia-mail")
+OUTBOX = os.path.join(FOLDER, "outbox")
 CACHE = os.path.join(GLib.get_user_cache_dir(), "haltia-mail")
 SECRET = "password"
+# «Исходящие» is tried again this often (seconds) and when the network comes back.
+RETRY = 10 * 60
+# Send answers «queued» after this many seconds if the server has not taken
+# the letter yet (D-Bus callers wait 25 s by default); sending goes on.
+ANSWER_WITHIN = 20
+# The D-Bus contract for haltia-report: see AGENTS.md.
+INTERFACE = """
+<node>
+  <interface name="io.github.haltia_de.Mail">
+    <method name="Send">
+      <arg direction="in" type="s" name="to"/>
+      <arg direction="in" type="s" name="subject"/>
+      <arg direction="in" type="s" name="body"/>
+      <arg direction="in" type="as" name="attachments"/>
+      <arg direction="out" type="s" name="result"/>
+    </method>
+  </interface>
+</node>
+"""
+QUEUED, NOT_CONFIGURED = "queued", "not-configured"
 MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
           "августа", "сентября", "октября", "ноября", "декабря")
 LINK = re.compile(r"(?:https?://|mailto:)[^\s<>\"()]+")
@@ -203,6 +225,11 @@ class Mail(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
         self.window = None
+        self.dbus_id = None
+        self.retry = None
+        self.flushing = False
+        # Started by D-Bus (--gapplication-service): wait this long for calls.
+        self.set_inactivity_timeout(10000)
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -211,6 +238,26 @@ class Mail(Gtk.Application):
         self.back.set_enabled(False)
         self.add_action(self.back)
         self.set_accels_for_action("app.back", ["<Alt>Left", "Escape"])
+        # One worker for IMAP, SMTP and the vault, with or without a window.
+        self.worker = Worker()
+        self.vault = Vault(APP_ID, FOLDER, label="Почта")
+        self.outbox = outbox.Outbox(OUTBOX)
+        Gio.NetworkMonitor.get_default().connect(
+            "network-changed", lambda _m, available: available and self.flush())
+        self.flush()
+
+    def do_dbus_register(self, connection, path):
+        if not Gtk.Application.do_dbus_register(self, connection, path):
+            return False
+        info = Gio.DBusNodeInfo.new_for_xml(INTERFACE).interfaces[0]
+        self.dbus_id = connection.register_object(path, info, self.dbus_call, None, None)
+        return True
+
+    def do_dbus_unregister(self, connection, path):
+        if self.dbus_id is not None:
+            connection.unregister_object(self.dbus_id)
+            self.dbus_id = None
+        Gtk.Application.do_dbus_unregister(self, connection, path)
 
     def do_activate(self):
         if self.window is None:
@@ -225,8 +272,6 @@ class Mail(Gtk.Application):
         provider.load_from_data(CSS)
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        self.worker = Worker()
-        self.vault = Vault(APP_ID, FOLDER, label="Почта")
         self.config = read_config()
         self.box = None
         self.role = INBOX
@@ -374,6 +419,7 @@ class Mail(Gtk.Application):
             except OSError:
                 pass
             self.opened(box)
+            self.flush()
 
         def failed(e):
             self.check_btn.set_sensitive(True)
@@ -412,8 +458,11 @@ class Mail(Gtk.Application):
 
     def sign_out(self):
         address = self.box.address if self.box else ""
-        if not dialogs.ask(self.window, "Выйти из почты %s? Пароль приложения будет "
-                           "удалён, письма на сервере останутся." % address, "Выйти"):
+        question = ("Выйти из почты %s? Пароль приложения будет удалён, письма на "
+                    "сервере останутся." % address)
+        if self.outbox.names():
+            question += " Неотправленные письма будут удалены."
+        if not dialogs.ask(self.window, question, "Выйти"):
             return
         box, self.box = self.box, None
         self.gen += 1
@@ -423,13 +472,17 @@ class Mail(Gtk.Application):
             if box is not None:
                 box.close()
             self.vault.drop(SECRET)
+            self.outbox.clear()
             safe = re.sub(r"[^\w.@-]", "_", address.lower())
             if safe:
                 shutil.rmtree(os.path.join(CACHE, safe), ignore_errors=True)
             shutil.rmtree(os.path.join(CACHE, "files"), ignore_errors=True)
 
-        self.worker.do(work, lambda _r: None,
-                       lambda e: dialogs.info(self.window, error_text(e)))
+        def failed(e):
+            self.waiting()
+            dialogs.info(self.window, error_text(e))
+
+        self.worker.do(work, lambda _r: self.waiting(), failed)
         self.signin_status.set_text("")
         self.show("signin")
 
@@ -711,6 +764,119 @@ class Mail(Gtk.Application):
             dialogs.info(self.window, error_text(e))
 
         self.worker.do(lambda: box.trash(role, uid), done, failed)
+
+    # Sending: the D-Bus method Send and «Исходящие», with or without a window
+
+    def account(self):
+        """(address, provider) of the saved mailbox, or None."""
+        section = read_config()["mail"]
+        address = section.get("address", "")
+        provider = servers.servers(address) or servers.from_field(section.get("imap", ""))
+        return (address, provider) if address and provider else None
+
+    def deliver(self, account, password):
+        """In the worker: «Исходящие» to SMTP -> {name: SENT or REFUSED}; what
+        did not go stays for the next try."""
+        if not password:
+            return {}
+        address, provider = account
+        sender = outbox.Sender(address, password, provider.smtp)
+        try:
+            done, _error = self.outbox.flush(sender.send)
+        finally:
+            sender.close()
+        return done
+
+    def flush(self):
+        """One try to send «Исходящие»."""
+        account = self.account()
+        if account is None or self.flushing or not self.outbox.names():
+            self.waiting()
+            return
+
+        def done(_result):
+            self.flushing = False
+            self.waiting()
+
+        self.flushing = True
+        self.worker.do(lambda: self.deliver(account, self.vault.get(SECRET)), done, done)
+
+    def waiting(self):
+        """While letters wait, Почта keeps running (also without a window) and
+        tries again every RETRY seconds and when the network comes back."""
+        letters = bool(self.outbox.names())
+        if letters and self.retry is None:
+            self.hold()
+            self.retry = GLib.timeout_add_seconds(RETRY, lambda: self.flush() or True)
+        elif not letters and self.retry is not None:
+            GLib.source_remove(self.retry)
+            self.retry = None
+            self.release()
+
+    def dbus_call(self, _connection, _sender, _path, _interface, method, parameters,
+                  invocation):
+        if method != "Send":
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod",
+                                         "No method %s" % method)
+            return
+        to, subject, body, attachments = parameters.unpack()
+        account = self.account()
+        if account is None:
+            invocation.return_value(GLib.Variant("(s)", (NOT_CONFIGURED,)))
+            return
+        pending = [invocation]
+
+        def answer(result=None, error=None, text=""):
+            if not pending:
+                return
+            call = pending.pop()
+            if error:
+                call.return_dbus_error(error, text)
+            else:
+                call.return_value(GLib.Variant("(s)", (result,)))
+
+        def late():
+            answer(QUEUED)
+            return False
+
+        timer = GLib.timeout_add_seconds(ANSWER_WITHIN, late)
+        self.hold()
+
+        def work():
+            letter = outbox.compose(account[0], to, subject, body, attachments)
+            try:
+                password = self.vault.get(SECRET)
+            except Locked:
+                password = None   # kept until the keyring opens
+            else:
+                if not password:
+                    return NOT_CONFIGURED
+            name = self.outbox.put(letter)
+            return self.deliver(account, password).get(name, QUEUED)
+
+        def finish():
+            if pending:
+                GLib.source_remove(timer)
+            self.release()
+            self.waiting()
+
+        def done(result):
+            finish()
+            if result == outbox.REFUSED:
+                answer(error="io.github.haltia_de.Mail.Error.Refused",
+                       text="The mail server refused the letter.")
+            else:
+                answer(result)
+
+        def failed(e):
+            finish()
+            if isinstance(e, ValueError):
+                answer(error="org.freedesktop.DBus.Error.InvalidArgs", text=str(e))
+            else:
+                answer(error="org.freedesktop.DBus.Error.Failed",
+                       text="Cannot keep the letter in the outbox.")
+
+        self.worker.do(work, done, failed)
 
 
 if __name__ == "__main__":

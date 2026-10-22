@@ -7,6 +7,7 @@ Not thread-safe and blocking: the program calls it from one worker thread.
     box.page(INBOX, 0, 50)            -> ([Summary], how many letters in all)
     box.read(INBOX, uid)              -> Letter (and the letter is seen)
     box.trash(INBOX, uid)             -> moved to the folder «Корзина»
+    box.save_sent(raw, message_id)    -> the sent letter in «Отправленные»
 """
 
 import base64
@@ -389,4 +390,23 @@ class Mailbox:
             cache = self._cache(role)
             cache.lines.pop(uid, None)
             cache.save()
+        return self._again(work)
+
+    # A sent letter
+
+    def save_sent(self, raw, message_id):
+        """Puts the sent letter into «Отправленные» (APPEND) unless the server
+        already keeps it there (Gmail and others keep what went through their
+        SMTP); False when the mailbox has no such folder."""
+        def work(conn):
+            try:
+                name = self._folder(SENT)
+            except KeyError:
+                return False
+            self._select(conn, SENT)
+            found = self._ok(conn.uid("SEARCH", None, "HEADER", "Message-ID", quote(message_id)))
+            if not b" ".join(d for d in found if d).split():
+                self._ok(conn.append(quote(name), "(\\Seen)", time.time(), raw))
+            self.uids.pop(SENT, None)
+            return True
         return self._again(work)

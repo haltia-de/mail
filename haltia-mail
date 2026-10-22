@@ -2,8 +2,10 @@
 # Почта: one mailbox, big letters. Sign in with the address and an app
 # password (the servers come from the domain); then «Входящие»,
 # «Отправленные» and «Корзина», a big list loaded in pages, and a letter as
-# plain text with its attachments. IMAP runs in one worker thread; the
-# password lives in haltia_kit.vault and «Выйти» deletes it.
+# plain text with its attachments; a new letter with files goes out over
+# SMTP, and files shared from other programs start one. IMAP and SMTP run in
+# one worker thread; the password lives in haltia_kit.vault and «Выйти»
+# deletes it.
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 import configparser
@@ -31,8 +33,9 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 
 from haltia_kit import dialogs, share
 from haltia_kit.vault import Locked, Vault
-from haltia_mail import servers
+from haltia_mail import servers, smtp
 from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
+from haltia_mail.letter import clean_name
 
 APP_ID = "io.github.haltia_de.Mail"
 ON_HALTIA = "Haltia" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
@@ -66,6 +69,9 @@ headerbar button { min-width: 88px; min-height: 88px; font-size: 34px; }
 .letter-text { font-size: 26px; }
 .files label, .files button, .trash { font-size: 24px; }
 .files button, .trash { min-height: 72px; }
+.compose > label, .compose entry, .compose > box > button { font-size: 28px; }
+.compose entry { min-height: 72px; }
+.compose > box > button { min-height: 80px; }
 """
 
 
@@ -127,6 +133,8 @@ def nice_size(size):
 def error_text(e):
     if isinstance(e, LoginFailed):
         return "Почта не приняла адрес или пароль. Нужен пароль приложения, а не обычный."
+    if isinstance(e, smtp.Refused):
+        return "Сервер не принял письмо: %s" % e
     if isinstance(e, Locked):
         return "Связка ключей закрыта, пароль не прочитать."
     if isinstance(e, KeyError):
@@ -201,7 +209,8 @@ class Row(Gtk.ListBoxRow):
 
 class Mail(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID)
+        # Files shared from other programs come as «open»: a new letter with them.
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.window = None
 
     def do_startup(self):
@@ -217,6 +226,13 @@ class Mail(Gtk.Application):
             self.build()
             self.start()
         self.window.present()
+
+    def do_open(self, files, _count, _hint):
+        self.do_activate()
+        for gfile in files:
+            self.attach(gfile)
+        if self.box is not None:
+            self.show("compose")
 
     # The window
 
@@ -235,6 +251,8 @@ class Mail(Gtk.Application):
         self.loading = False
         self.letter = None
         self.letter_uid = None
+        self.smtp_server = None
+        self.attached = []   # [(name, path, size)]: the new letter's files, copied
 
         window = Gtk.ApplicationWindow(application=self, title="Почта")
         window.set_default_size(1280, 800)
@@ -258,14 +276,18 @@ class Mail(Gtk.Application):
         self.refresh = Gtk.Button(label="⟳")
         self.refresh.set_tooltip_text("Обновить")
         self.refresh.connect("clicked", lambda *_a: self.load(0))
+        self.write = Gtk.Button(label="Написать")
+        self.write.connect("clicked", lambda *_a: self.show("compose"))
         header.pack_end(self.leave)
         header.pack_end(self.refresh)
+        header.pack_end(self.write)
         window.set_titlebar(header)
 
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.stack.add_named(self.build_signin(), "signin")
         self.stack.add_named(self.build_list(), "list")
         self.stack.add_named(self.build_letter(), "letter")
+        self.stack.add_named(self.build_compose(), "compose")
         self.stack.add_named(label("", xalign=0.5), "wait")
         window.add(self.stack)
         window.show_all()
@@ -273,13 +295,15 @@ class Mail(Gtk.Application):
 
     def show(self, page):
         self.stack.set_visible_child_name(page)
-        self.back.set_enabled(page == "letter")
-        self.leave.set_visible(page == "list")
-        self.refresh.set_visible(page == "list")
-        self.title.set_text({"list": NAMES[self.role], "letter": "Письмо"}.get(page, "Почта"))
+        self.back.set_enabled(page in ("letter", "compose"))
+        for button in (self.leave, self.refresh, self.write):
+            button.set_visible(page == "list")
+        self.title.set_text({"list": NAMES[self.role], "letter": "Письмо",
+                             "compose": "Новое письмо"}.get(page, "Почта"))
 
     def go_back(self):
-        if self.stack.get_visible_child_name() == "letter":
+        """Back to the list; a new letter keeps what is written in it."""
+        if self.stack.get_visible_child_name() in ("letter", "compose"):
             self.letter_uid = None
             self.show("list")
 
@@ -373,7 +397,7 @@ class Mail(Gtk.Application):
                 write_config(self.config)
             except OSError:
                 pass
-            self.opened(box)
+            self.opened(box, provider.smtp)
 
         def failed(e):
             self.check_btn.set_sensitive(True)
@@ -399,16 +423,19 @@ class Mail(Gtk.Application):
             if not password:
                 self.show("signin")
                 return
-            self.opened(Mailbox(address, password, provider.imap, CACHE))
+            self.opened(Mailbox(address, password, provider.imap, CACHE), provider.smtp)
 
         self.worker.do(lambda: self.vault.get(SECRET), done, failed)
 
-    def opened(self, box):
+    def opened(self, box, smtp_server):
         self.box = box
+        self.smtp_server = smtp_server
         self.role = INBOX
         self.folder_buttons[INBOX].set_active(True)
         self.show("list")
         self.load(0)
+        if self.attached:   # files shared before signing in
+            self.show("compose")
 
     def sign_out(self):
         address = self.box.address if self.box else ""
@@ -418,6 +445,7 @@ class Mail(Gtk.Application):
         box, self.box = self.box, None
         self.gen += 1
         self.clear_list()
+        self.clear_compose()
 
         def work():
             if box is not None:
@@ -649,21 +677,21 @@ class Mail(Gtk.Application):
             row.pack_start(button, False, False, 0)
         return row
 
-    def temp_file(self, attachment):
-        """The attachment as a file of its own folder (only we can read it), so
-        attachments with the same name do not meet."""
+    def temp_file(self, name, data):
+        """The bytes as a file of its own folder (only we can read it), so
+        files with the same name do not meet."""
         folder = os.path.join(CACHE, "files")
         os.makedirs(folder, mode=0o700, exist_ok=True)
         folder = tempfile.mkdtemp(dir=folder)
-        path = os.path.join(folder, attachment.name)
+        path = os.path.join(folder, name)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
-            f.write(attachment.data)
+            f.write(data)
         return path
 
     def open_file(self, attachment):
         try:
-            path = self.temp_file(attachment)
+            path = self.temp_file(attachment.name, attachment.data)
             Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
         except (OSError, GLib.Error):
             dialogs.info(self.window, "Нет программы, которая открывает такие файлы.")
@@ -684,7 +712,7 @@ class Mail(Gtk.Application):
 
     def send_file(self, attachment):
         try:
-            path = self.temp_file(attachment)
+            path = self.temp_file(attachment.name, attachment.data)
         except OSError:
             dialogs.info(self.window, "Не удалось подготовить файл.")
             return
@@ -711,6 +739,150 @@ class Mail(Gtk.Application):
             dialogs.info(self.window, error_text(e))
 
         self.worker.do(lambda: box.trash(role, uid), done, failed)
+
+    # A new letter
+
+    def build_compose(self):
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        column.get_style_context().add_class("compose")
+        for side in ("top", "bottom", "start", "end"):
+            getattr(column, "set_margin_" + side)(24)
+        self.to = Gtk.Entry(input_purpose=Gtk.InputPurpose.EMAIL)
+        self.to.set_placeholder_text("ivan@yandex.ru")
+        self.subject = Gtk.Entry()
+        self.to.connect("activate", lambda *_a: self.subject.grab_focus())
+        self.body = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.body.get_style_context().add_class("letter-text")
+        for side in ("top", "bottom", "left", "right"):
+            getattr(self.body, "set_%s_margin" % side)(12)
+        self.body.set_size_request(-1, 240)
+        frame = Gtk.Frame()
+        frame.add(self.body)
+        self.attached_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.attached_box.get_style_context().add_class("files")
+        buttons = Gtk.Box(spacing=12)
+        attach = Gtk.Button(label="Прикрепить")
+        attach.connect("clicked", lambda *_a: self.choose_files())
+        self.send_btn = Gtk.Button(label="Отправить")
+        self.send_btn.get_style_context().add_class("suggested-action")
+        self.send_btn.connect("clicked", lambda *_a: self.send())
+        buttons.pack_start(attach, False, False, 0)
+        buttons.pack_end(self.send_btn, False, False, 0)
+        self.compose_status = label("", "status", wrap=True)
+        for widget in (label("Кому"), self.to, label("Тема"), self.subject, label("Текст"),
+                       frame, self.attached_box, buttons, self.compose_status):
+            column.pack_start(widget, False, False, 0)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(column)
+        return scroll
+
+    def choose_files(self):
+        chooser = Gtk.FileChooserNative.new("Прикрепить файлы", self.window,
+                                            Gtk.FileChooserAction.OPEN, "Прикрепить", "Отмена")
+        chooser.set_select_multiple(True)
+        if chooser.run() == Gtk.ResponseType.ACCEPT:
+            for gfile in chooser.get_files():
+                self.attach(gfile)
+        chooser.destroy()
+
+    def attach(self, gfile):
+        """A copy of the file goes with the letter: the program that shared it
+        may delete its own at once."""
+        name = clean_name(gfile.get_basename() or "") or "файл"
+        try:
+            _ok, data, _etag = gfile.load_contents(None)
+            path = self.temp_file(name, data)
+        except (GLib.Error, OSError):
+            dialogs.info(self.window, "Не удалось прикрепить файл «%s»." % name)
+            return
+        self.attached.append((name, path, len(data)))
+        self.show_attached()
+
+    def show_attached(self):
+        for child in self.attached_box.get_children():
+            self.attached_box.remove(child)
+        for item in self.attached:
+            row = Gtk.Box(spacing=12)
+            name = label("%s · %s" % (item[0], nice_size(item[2])), ellipsize=True)
+            name.set_hexpand(True)
+            remove = Gtk.Button(label="Убрать")
+            remove.connect("clicked", lambda _b, it=item: self.detach(it))
+            row.pack_start(name, True, True, 0)
+            row.pack_start(remove, False, False, 0)
+            self.attached_box.pack_start(row, False, False, 0)
+        self.attached_box.show_all()
+
+    def detach(self, item):
+        if item in self.attached:
+            self.attached.remove(item)
+            shutil.rmtree(os.path.dirname(item[1]), ignore_errors=True)
+            self.show_attached()
+
+    def clear_compose(self):
+        for item in list(self.attached):
+            self.detach(item)
+        self.to.set_text("")
+        self.subject.set_text("")
+        self.body.get_buffer().set_text("")
+        self.compose_status.set_text("")
+
+    def send(self):
+        box, server = self.box, self.smtp_server
+        if box is None or server is None:
+            return
+        to = self.to.get_text().strip()
+        try:
+            if not smtp.recipients(to):
+                self.compose_status.set_text("Укажите, кому письмо: адрес почты.")
+                return
+        except ValueError as e:
+            self.compose_status.set_text("Проверьте адрес «%s»." % e)
+            return
+        subject = self.subject.get_text().strip()
+        buffer = self.body.get_buffer()
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+        files = list(self.attached)
+        self.send_btn.set_sensitive(False)
+        self.compose_status.set_text("Отправляю…")
+
+        def work():
+            data = []
+            for name, path, _size in files:
+                with open(path, "rb") as f:
+                    data.append((name, f.read()))
+            msg = smtp.make(box.address, to, subject, text, data)
+            missed = ""
+            try:
+                raw = smtp.send(box.address, box.password, server, msg)
+            except smtp.Refused as e:
+                if e.raw is None:
+                    raise
+                raw, missed = e.raw, str(e)
+            try:
+                saved = box.save_sent(raw, msg["Message-ID"])
+            except Exception:  # noqa: BLE001 - the letter went all the same
+                saved = False
+            return saved, missed
+
+        def done(answer):
+            saved, missed = answer
+            self.send_btn.set_sensitive(True)
+            self.clear_compose()
+            self.show("list")
+            if self.role == SENT:
+                self.load(0)
+            text = "Письмо отправлено."
+            if missed:
+                text += " Не дошло до: %s." % missed
+            if not saved:
+                text += " В «Отправленные» его положить не удалось."
+            dialogs.info(self.window, text)
+
+        def failed(e):
+            self.send_btn.set_sensitive(True)
+            self.compose_status.set_text(error_text(e))
+
+        self.worker.do(work, done, failed)
 
 
 if __name__ == "__main__":

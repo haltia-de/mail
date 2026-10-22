@@ -125,10 +125,16 @@ class FakeServer:
                 if not line:
                     break
                 line = line.decode("utf-8").rstrip("\r\n")
+                literal = None
+                size = re.search(r"\{(\d+)\}$", line)
+                if size:   # APPEND's letter
+                    send("+ go ahead\r\n")
+                    literal = rfile.read(int(size.group(1)))
+                    rfile.readline()
                 tag, _, rest = line.partition(" ")
                 with self.lock:
                     self.commands.append(rest)
-                    done = self.command(tag, rest, state, send)
+                    done = self.command(tag, rest, state, send, literal)
                 if done:
                     break
         except OSError:
@@ -139,7 +145,7 @@ class FakeServer:
             except OSError:
                 pass
 
-    def command(self, tag, rest, state, send):
+    def command(self, tag, rest, state, send, literal=None):
         args = tokens(rest)
         name = args[0].upper()
         args = args[1:]
@@ -163,6 +169,15 @@ class FakeServer:
                 flags = ["\\HasNoChildren"] + ([box.special] if box.special else [])
                 send('* LIST (%s) "/" "%s"\r\n' % (" ".join(flags), folder))
             send("%s OK done\r\n" % tag)
+        elif name == "APPEND" and literal is not None:
+            box = self.folders.get(args[0])
+            if box is None:
+                send("%s NO [TRYCREATE] no such folder\r\n" % tag)
+                return
+            flags = set(args[1].strip("()").split()) if args[1].startswith("(") else set()
+            box.letters.append([box.next_uid, flags, literal])
+            box.next_uid += 1
+            send("%s OK [APPENDUID %d %d] done\r\n" % (tag, self.validity, box.next_uid - 1))
         elif name in ("SELECT", "EXAMINE"):
             if args[0] not in self.folders:
                 send("%s NO no such folder\r\n" % tag)
@@ -190,6 +205,10 @@ class FakeServer:
     def uid(self, tag, command, args, box, send):
         uids = [letter[0] for letter in box.letters]
         if command == "SEARCH":
+            if args and args[0].upper() == "HEADER":   # HEADER name value
+                field, value = args[1].upper().encode(), args[2].lower().encode()
+                uids = [uid for uid, _flags, raw in box.letters
+                        if value in header_fields(raw, {field}).lower()]
             send("* SEARCH %s\r\n%s OK done\r\n" % (" ".join(map(str, uids)), tag))
             return
         chosen = uid_set(args[0], uids)

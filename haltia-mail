@@ -35,7 +35,7 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
 from haltia_kit import dialogs, share
 from haltia_kit.vault import Locked, Vault
 from haltia_mail import servers, smtp
-from haltia_mail.outbox import Outbox
+from haltia_mail.outbox import Outbox, accept
 from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
 from haltia_mail.letter import clean_name
 
@@ -49,7 +49,8 @@ CACHE = os.path.join(GLib.get_user_cache_dir(), "haltia-mail")
 # «Исходящие»: 0700, every letter's files 0600.
 OUTBOX = os.path.join(FOLDER, "outbox")
 RETRY = 600   # seconds between tries while letters wait
-# The D-Bus contract for haltia-report (AGENTS.md): Send -> queued, sent or not-configured.
+# The D-Bus contract for haltia-report (AGENTS.md): Send answers at once
+# (queued after keeping the letter, or not-configured); SMTP runs after.
 DBUS = """
 <node>
   <interface name="io.github.haltia_de.Mail">
@@ -248,6 +249,8 @@ class Mail(Gtk.Application):
         self.outbox = Outbox(OUTBOX)
         self.waiting = False     # held while «Исходящие» are not empty
         self.flushing = False
+        self.flush_again = False
+        self.live = True         # False after «Выйти», until the next sign-in
         self.set_inactivity_timeout(10000)
         Gio.NetworkMonitor.get_default().connect(
             "network-changed", lambda _m, up: up and self.flush())
@@ -283,42 +286,35 @@ class Mail(Gtk.Application):
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)
             return
         to, subject, body, paths = params.unpack()
-        account = self.account()
-        if account is None:
+        configured = self.live and self.account() is not None
+        if configured:
+            try:
+                if not self.vault.get(SECRET):
+                    configured = False
+            except Locked:
+                pass   # the letter waits until the keyring opens
+            except Exception as e:  # noqa: BLE001 - never the password
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed",
+                                             str(e) or type(e).__name__)
+                return
+        if not configured:
             invocation.return_value(GLib.Variant("(s)", ("not-configured",)))
             return
         self.hold()   # the service stays until it answers
-        address, provider = account
-
-        def work():
-            try:
-                password = self.vault.get(SECRET)
-                if not password:
-                    return "not-configured", len(self.outbox.names())
-            except Locked:
-                password = None   # the letter waits until the keyring opens
-            name = self.outbox.put(to, subject, body, paths)
-            if password:
-                self.send_outbox(address, password, provider)
-            waiting = self.outbox.names()
-            return ("queued" if name in waiting else "sent"), len(waiting)
-
-        def done(answer):
-            result, waiting = answer
+        try:
+            result = accept(self.outbox, True, to, subject, body, paths)
             invocation.return_value(GLib.Variant("(s)", (result,)))
-            self.waiting_changed(waiting)
+            self.waiting_changed(len(self.outbox.names()))
+        except ValueError as e:
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", str(e))
+            return
+        except Exception as e:  # noqa: BLE001 - a disk error: never the password
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed",
+                                         str(e) or type(e).__name__)
+            return
+        finally:
             self.release()
-
-        def failed(e):
-            if isinstance(e, ValueError):
-                invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs", str(e))
-            else:
-                # A disk or keyring error: never the password.
-                invocation.return_dbus_error("org.freedesktop.DBus.Error.Failed",
-                                             str(e) or type(e).__name__)
-            self.release()
-
-        self.worker.do(work, done, failed)
+        self.flush()
 
     def send_outbox(self, address, password, provider):
         """The waiting letters, on the worker thread; each one sent gets a copy
@@ -331,9 +327,13 @@ class Mail(Gtk.Application):
 
     def flush(self):
         """Another try for «Исходящие»: on start, when the network changes and
-        every 10 minutes."""
+        every 10 minutes, and after Send keeps a letter."""
         account = self.account()
-        if self.flushing or account is None:
+        if not self.live or account is None:
+            self.flush_again = False
+            return
+        if self.flushing:
+            self.flush_again = True
             return
         self.flushing = True
         address, provider = account
@@ -351,9 +351,15 @@ class Mail(Gtk.Application):
         def done(waiting):
             self.flushing = False
             self.waiting_changed(waiting)
+            if self.flush_again:
+                self.flush_again = False
+                self.flush()
 
         def failed(_e):
             self.flushing = False
+            if self.flush_again:
+                self.flush_again = False
+                self.flush()
 
         self.worker.do(work, done, failed)
 
@@ -568,6 +574,7 @@ class Mail(Gtk.Application):
         self.worker.do(lambda: self.vault.get(SECRET), done, failed)
 
     def opened(self, box, smtp_server):
+        self.live = True
         self.box = box
         self.smtp_server = smtp_server
         self.role = INBOX
@@ -587,8 +594,12 @@ class Mail(Gtk.Application):
             return
         box, self.box = self.box, None
         self.gen += 1
+        self.live = False
         self.clear_list()
         self.clear_compose()
+        # On the GTK thread, before the worker job: a flush already running
+        # sees the stamp and does not send a letter «Выйти» dropped.
+        self.outbox.clear()
 
         def work():
             if box is not None:
@@ -598,7 +609,6 @@ class Mail(Gtk.Application):
             if safe:
                 shutil.rmtree(os.path.join(CACHE, safe), ignore_errors=True)
             shutil.rmtree(os.path.join(CACHE, "files"), ignore_errors=True)
-            self.outbox.clear()
 
         self.waiting_changed(0)
         self.worker.do(work, lambda _r: None,

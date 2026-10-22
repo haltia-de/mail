@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -112,6 +113,57 @@ class OutboxTests(unittest.TestCase):
         self.assertEqual(len(self.box.names()), 1)
         self.box.clear()
         self.assertEqual(self.box.names(), [])
+
+    def test_send_answers_queued_at_once(self):
+        """Send answers queued (or not-configured) without waiting for SMTP."""
+        self.assertEqual(
+            outbox.accept(self.box, False, "ivan@ya.ru", "Тема", "Текст"),
+            "not-configured")
+        self.assertEqual(self.box.names(), [])
+
+        def smtp_must_wait(*_a, **_k):
+            raise AssertionError("Send must not wait for SMTP")
+
+        with mock.patch("haltia_mail.outbox.smtp.send", smtp_must_wait):
+            self.assertEqual(
+                outbox.accept(self.box, True, "ivan@ya.ru", "Тема", "Текст"),
+                "queued")
+        self.assertEqual(len(self.box.names()), 1)
+        self.assertEqual(self.server.sent, [])
+
+    def test_clear_during_flush_does_not_send(self):
+        """«Выйти» drops waiting letters; a flush already running must not send them."""
+        self.box.put("ivan@ya.ru", "Тема", "Текст")
+        orig_load = Outbox._load
+        barrier = threading.Event()
+        proceed = threading.Event()
+
+        def paused(obj, name):
+            result = orig_load(obj, name)
+            barrier.set()
+            if not proceed.wait(2):
+                raise AssertionError("clear did not run")
+            return result
+
+        caught = []
+
+        def run():
+            try:
+                caught.append(self.flush())
+            except Exception as e:  # noqa: BLE001 - the test checks sent
+                caught.append(e)
+
+        with mock.patch.object(Outbox, "_load", paused):
+            thread = threading.Thread(target=run)
+            thread.start()
+            self.assertTrue(barrier.wait(2))
+            self.box.clear()
+            proceed.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.server.sent, [])
+        self.assertEqual(self.box.names(), [])
+        self.assertEqual(caught, [[]])
 
 
 if __name__ == "__main__":

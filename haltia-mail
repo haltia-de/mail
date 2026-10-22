@@ -41,9 +41,14 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402,F811
 
 from haltia_kit import dialogs, share  # noqa: E402
 from haltia_kit.vault import Locked, Vault  # noqa: E402
+try:
+    from haltia_kit import log as kit_log  # noqa: E402
+except ImportError:
+    kit_log = None
 from haltia_mail import servers, smtp  # noqa: E402
 from haltia_mail.outbox import Outbox, accept  # noqa: E402
-from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox  # noqa: E402
+from haltia_mail.imap import (  # noqa: E402
+    INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox, page_reply)
 from haltia_mail.letter import clean_name  # noqa: E402
 
 ON_HALTIA = "Haltia" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
@@ -83,6 +88,7 @@ headerbar button { min-width: 88px; min-height: 88px; font-size: 34px; }
 .signin entry { min-height: 72px; }
 .signin button { min-height: 80px; }
 .hint { font-size: 22px; }
+.signin .reply { font-size: 18px; opacity: 0.6; }
 .folders button { font-size: 28px; min-height: 80px; }
 .mail-row { padding: 14px 24px; }
 .from { font-size: 28px; }
@@ -156,9 +162,17 @@ def nice_size(size):
     return ("%.1f МБ" % (size / 1024 / 1024)).replace(".", ",")
 
 
+def log_line(text):
+    """One line in kit's log; GLib's log when kit has no log.line."""
+    if kit_log is not None and hasattr(kit_log, "line"):
+        kit_log.line(text)
+        return
+    GLib.log(APP_ID, GLib.LogLevelFlags.LEVEL_WARNING, "%s", text)
+
+
 def error_text(e):
     if isinstance(e, LoginFailed):
-        return "Почта не приняла адрес или пароль. Нужен пароль приложения, а не обычный."
+        return "Почта не приняла адрес или пароль."
     if isinstance(e, smtp.Refused):
         return "Сервер не принял письмо: %s" % e
     if isinstance(e, Locked):
@@ -485,10 +499,12 @@ class Mail(Gtk.Application):
         self.check_btn.get_style_context().add_class("suggested-action")
         self.check_btn.connect("clicked", lambda *_a: self.check())
         self.signin_status = label("", "status", wrap=True)
+        self.server_reply = label("", "reply", wrap=True)
+        self.server_reply.set_selectable(True)
 
         for widget in (label("Адрес почты"), self.address, label("Пароль приложения"),
                        self.password, self.server_label, self.server, self.hint,
-                       self.check_btn, self.signin_status):
+                       self.check_btn, self.signin_status, self.server_reply):
             column.pack_start(widget, False, False, 0)
         for widget in (self.server_label, self.server):
             widget.set_no_show_all(True)
@@ -511,25 +527,27 @@ class Mail(Gtk.Application):
         if known:
             self.hint.set_text(known.hint)
         else:
-            self.hint.set_text(servers.OTHER_HINT if other else
-                               "Почта пускает программы по паролю приложения: "
-                               "его создают в настройках безопасности почты.")
+            self.hint.set_text(servers.OTHER_HINT if other else servers.APP_HINT)
 
     def check(self):
         address = self.address.get_text().strip()
         password = self.password.get_text().strip().replace(" ", "")
         if not servers.domain(address):
             self.signin_status.set_text("Введите адрес почты целиком, например ivan@yandex.ru.")
+            self.server_reply.set_text("")
             return
         if not password:
             self.signin_status.set_text("Введите пароль приложения.")
+            self.server_reply.set_text("")
             return
         provider = servers.servers(address) or servers.from_field(self.server.get_text())
         if provider is None:
             self.signin_status.set_text("Укажите сервер, например imap.example.org.")
+            self.server_reply.set_text("")
             return
         self.check_btn.set_sensitive(False)
         self.signin_status.set_text("Проверяю…")
+        self.server_reply.set_text("")
         box = Mailbox(address, password, provider.imap, CACHE)
 
         def work():
@@ -541,6 +559,7 @@ class Mail(Gtk.Application):
             self.check_btn.set_sensitive(True)
             self.password.set_text("")
             self.signin_status.set_text("")
+            self.server_reply.set_text("")
             section = self.config["mail"]
             section["address"] = address
             section["imap"] = "%s:%d" % provider.imap
@@ -553,10 +572,20 @@ class Mail(Gtk.Application):
 
         def failed(e):
             self.check_btn.set_sensitive(True)
-            self.signin_status.set_text(error_text(e))
+            self.show_login_failed(e)
             box.close()
 
         self.worker.do(work, done, failed)
+
+    def show_login_failed(self, e, status=True):
+        """The sign-in page: the friendly line, the server's words in grey,
+        a line in kit's log. Never the password."""
+        if status:
+            self.signin_status.set_text(error_text(e))
+        reply = page_reply(e)
+        self.server_reply.set_text(reply)
+        if reply:
+            log_line("IMAP login failed: %s" % reply)
 
     def start(self):
         """The saved mailbox, if the vault keeps its password; else signing in."""
@@ -568,7 +597,7 @@ class Mail(Gtk.Application):
             return
 
         def failed(e):
-            self.signin_status.set_text(error_text(e))
+            self.show_login_failed(e)
             self.show("signin")
 
         def done(password):
@@ -620,6 +649,7 @@ class Mail(Gtk.Application):
         self.worker.do(work, lambda _r: None,
                        lambda e: dialogs.info(self.window, error_text(e)))
         self.signin_status.set_text("")
+        self.server_reply.set_text("")
         self.show("signin")
 
     # The list
@@ -717,6 +747,7 @@ class Mail(Gtk.Application):
             self.box = None
             self.signin_status.set_text(
                 "Почта больше не принимает пароль. Введите новый пароль приложения.")
+            self.show_login_failed(e, status=False)
             self.show("signin")
             return
         self.placeholder.set_text("")

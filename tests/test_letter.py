@@ -76,7 +76,23 @@ class ServerTests(unittest.TestCase):
                               ("a@hotmail.com", "outlook.office365.com"),
                               ("a@outlook.com", "outlook.office365.com")):
             self.assertEqual(servers.servers(address).imap, (host, 993), address)
-            self.assertTrue(servers.servers(address).hint)
+            hint = servers.servers(address).hint
+            self.assertTrue(hint)
+            self.assertIn("пароль приложения", hint.lower())
+            self.assertIn("IMAP", hint)
+
+    def test_app_password_hints(self):
+        yandex = servers.servers("a@ya.ru").hint
+        self.assertIn("Яндекс ID → Безопасность → Пароли приложений → Почта", yandex)
+        self.assertIn("Почтовые программы: IMAP и пароли приложений", yandex)
+        mailru = servers.servers("a@mail.ru").hint
+        self.assertIn("Пароли для внешних приложений", mailru)
+        gmail = servers.servers("a@gmail.com").hint
+        self.assertIn("Пароли приложений", gmail)
+        self.assertIn(servers.APP_HINT, yandex)
+        self.assertIn(servers.APP_HINT, mailru)
+        self.assertIn(servers.APP_HINT, gmail)
+        self.assertEqual(servers.servers("a@rambler.ru").hint, servers.APP_HINT)
 
     def test_other_domain(self):
         self.assertIsNone(servers.servers("me@example.org"))

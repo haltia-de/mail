@@ -14,6 +14,7 @@ import base64
 from datetime import datetime, timezone
 import imaplib
 import json
+import logging
 import os
 import re
 import ssl
@@ -34,10 +35,39 @@ USUAL = {
 }
 TIMEOUT = 30
 HEADERS = "BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)]"
+log = logging.getLogger(__name__)
 
 
 class LoginFailed(Exception):
-    """The server refused the address or the password."""
+    """The server refused the address or the password.
+
+    .reply is the server's words, never the password.
+    """
+
+    def __init__(self, reply=""):
+        self.reply = reply or ""
+        super().__init__(self.reply)
+
+
+def reply_of(error, password=""):
+    """The IMAP server's words from a login error, with the password taken out."""
+    raw = error.args[0] if getattr(error, "args", None) else error
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    elif raw is None:
+        text = ""
+    else:
+        text = str(raw)
+    if password:
+        for secret in {password, password.replace(" ", "")}:
+            if secret:
+                text = text.replace(secret, "…")
+    return text.strip()
+
+
+def page_reply(error):
+    """The server's words for the sign-in page; empty when it is not a login failure."""
+    return error.reply if isinstance(error, LoginFailed) else ""
 
 
 def decode_utf7(name):
@@ -228,7 +258,9 @@ class Mailbox:
                 conn.shutdown()
             except Exception:
                 pass
-            raise LoginFailed(str(e)) from None
+            reply = reply_of(e, self.password)
+            log.warning("IMAP login failed: %s", reply)
+            raise LoginFailed(reply) from None
         self.conn = conn
         self.selected = None
         return conn

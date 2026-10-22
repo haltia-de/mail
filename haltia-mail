@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+# Почта: one mailbox, big letters. Sign in with the address and an app
+# password (the servers come from the domain); then «Входящие»,
+# «Отправленные» and «Корзина», a big list loaded in pages, and a letter as
+# plain text with its attachments. IMAP runs in one worker thread; the
+# password lives in haltia_kit.vault and «Выйти» deletes it.
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import configparser
+import os
+import queue
+import re
+import shutil
+import sys
+import tempfile
+import threading
+from datetime import datetime, timedelta
+
+# haltia_mail sits next to the script in a checkout and in
+# PREFIX/share/haltia-mail when installed.
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _dir in (HERE, os.path.join(os.path.dirname(HERE), "share", "haltia-mail")):
+    if os.path.isdir(os.path.join(_dir, "haltia_mail")):
+        sys.path.insert(0, _dir)
+        break
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
+
+from haltia_kit import dialogs, share
+from haltia_kit.vault import Locked, Vault
+from haltia_mail import servers
+from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
+
+APP_ID = "io.github.haltia_de.Mail"
+ON_HALTIA = "Haltia" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+PAGE = 50
+CONFIG = os.path.join(GLib.get_user_config_dir(), "haltia", "mail.conf")
+# The vault's file when there is no keyring (the tablet): 0600, in Почта's own folder.
+FOLDER = os.path.join(GLib.get_user_data_dir(), "haltia-mail")
+CACHE = os.path.join(GLib.get_user_cache_dir(), "haltia-mail")
+SECRET = "password"
+MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+          "августа", "сентября", "октября", "ноября", "декабря")
+LINK = re.compile(r"(?:https?://|mailto:)[^\s<>\"()]+")
+
+CSS = b"""
+headerbar { min-height: 104px; padding-top: 0; padding-bottom: 0; }
+headerbar .title { font-size: 34px; }
+headerbar button { min-width: 88px; min-height: 88px; font-size: 34px; }
+.signin label, .signin entry, .signin button { font-size: 28px; }
+.signin entry { min-height: 72px; }
+.signin button { min-height: 80px; }
+.hint { font-size: 22px; }
+.folders button { font-size: 28px; min-height: 80px; }
+.mail-row { padding: 14px 24px; }
+.from { font-size: 28px; }
+.subject { font-size: 24px; }
+.when { font-size: 22px; opacity: 0.7; }
+.unread { font-weight: bold; }
+.status { font-size: 24px; }
+.letter-subject { font-size: 32px; font-weight: bold; }
+.letter-head { font-size: 22px; opacity: 0.8; }
+.letter-text { font-size: 26px; }
+.files label, .files button, .trash { font-size: 24px; }
+.files button, .trash { min-height: 72px; }
+"""
+
+
+def later(fn, *args):
+    """fn(*args) on the GTK thread, once."""
+    def call():
+        fn(*args)
+        return False
+    GLib.idle_add(call)
+
+
+class Worker:
+    """One thread for IMAP: imaplib is not thread-safe, and jobs keep their order."""
+
+    def __init__(self):
+        self.jobs = queue.Queue()
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def do(self, work, done=None, failed=None):
+        self.jobs.put((work, done, failed))
+
+    def run(self):
+        while True:
+            work, done, failed = self.jobs.get()
+            try:
+                result = work()
+            except Exception as e:  # noqa: BLE001 - shown to the person
+                if failed:
+                    later(failed, e)
+            else:
+                if done:
+                    later(done, result)
+
+
+def nice_when(when, full=False):
+    if when is None:
+        return ""
+    local = when.astimezone()
+    today = datetime.now().astimezone().date()
+    clock = local.strftime("%H:%M")
+    if full:
+        return "%d %s %d, %s" % (local.day, MONTHS[local.month - 1], local.year, clock)
+    if local.date() == today:
+        return clock
+    if local.date() == today - timedelta(days=1):
+        return "вчера"
+    short = "%d %s" % (local.day, MONTHS[local.month - 1][:3])
+    return short if local.year == today.year else "%s %d" % (short, local.year)
+
+
+def nice_size(size):
+    if size < 1024:
+        return "%d Б" % size
+    if size < 1024 * 1024:
+        return "%d КБ" % round(size / 1024)
+    return ("%.1f МБ" % (size / 1024 / 1024)).replace(".", ",")
+
+
+def error_text(e):
+    if isinstance(e, LoginFailed):
+        return "Почта не приняла адрес или пароль. Нужен пароль приложения, а не обычный."
+    if isinstance(e, Locked):
+        return "Связка ключей закрыта, пароль не прочитать."
+    if isinstance(e, KeyError):
+        return "На сервере нет этой папки."
+    if isinstance(e, OSError):
+        return "Нет связи с сервером почты."
+    return "Ошибка почты: %s" % e
+
+
+def label(text="", css=None, xalign=0.0, wrap=False, ellipsize=False):
+    widget = Gtk.Label(label=text, xalign=xalign)
+    if css:
+        for name in css.split():
+            widget.get_style_context().add_class(name)
+    if wrap:
+        widget.set_line_wrap(True)
+        widget.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    if ellipsize:
+        widget.set_ellipsize(Pango.EllipsizeMode.END)
+    return widget
+
+
+def read_config():
+    config = configparser.ConfigParser()
+    config.read(CONFIG, encoding="utf-8")
+    if not config.has_section("mail"):
+        config.add_section("mail")
+    return config
+
+
+def write_config(config):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    new = CONFIG + ".new"
+    with open(new, "w", encoding="utf-8") as f:
+        config.write(f)
+    os.replace(new, CONFIG)
+
+
+def unique(folder, name):
+    stem, dot, ext = name.rpartition(".")
+    if not stem:
+        stem, dot, ext = name, "", ""
+    path, n = os.path.join(folder, name), 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(folder, "%s (%d)%s%s" % (stem, n, dot, ext))
+    return path
+
+
+class Row(Gtk.ListBoxRow):
+    def __init__(self, line):
+        super().__init__()
+        self.line = line
+        self.get_style_context().add_class("mail-row")
+        grid = Gtk.Grid(column_spacing=16, row_spacing=4)
+        self.sender = label(line.sender, "from", ellipsize=True)
+        self.sender.set_hexpand(True)
+        self.subject = label(line.subject, "subject", ellipsize=True)
+        when = label(nice_when(line.when), "when", xalign=1.0)
+        grid.attach(self.sender, 0, 0, 1, 1)
+        grid.attach(when, 1, 0, 1, 1)
+        grid.attach(self.subject, 0, 1, 2, 1)
+        self.add(grid)
+        self.set_unread(line.unread)
+
+    def set_unread(self, unread):
+        self.line = self.line._replace(unread=unread)
+        for widget in (self.sender, self.subject):
+            context = widget.get_style_context()
+            (context.add_class if unread else context.remove_class)("unread")
+
+
+class Mail(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.window = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.back = Gio.SimpleAction.new("back", None)
+        self.back.connect("activate", lambda *_a: self.go_back())
+        self.back.set_enabled(False)
+        self.add_action(self.back)
+        self.set_accels_for_action("app.back", ["<Alt>Left", "Escape"])
+
+    def do_activate(self):
+        if self.window is None:
+            self.build()
+            self.start()
+        self.window.present()
+
+    # The window
+
+    def build(self):
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.worker = Worker()
+        self.vault = Vault(APP_ID, FOLDER, label="Почта")
+        self.config = read_config()
+        self.box = None
+        self.role = INBOX
+        self.gen = 0
+        self.loaded = self.total = 0
+        self.loading = False
+        self.letter = None
+        self.letter_uid = None
+
+        window = Gtk.ApplicationWindow(application=self, title="Почта")
+        window.set_default_size(1280, 800)
+        window.set_icon_name(APP_ID)
+        self.window = window
+
+        header = Gtk.HeaderBar()
+        # The Haltia shell closes windows with its own button; any other
+        # desktop gets the usual window buttons in the header.
+        header.set_show_close_button(not ON_HALTIA)
+        self.title = label("Почта", "title", xalign=0.5)
+        header.set_custom_title(self.title)
+        back = Gtk.Button(label="←")
+        back.set_action_name("app.back")
+        back.set_no_show_all(True)
+        # Seen only while there is a step back; else the shell's «⇤» takes one home.
+        self.back.bind_property("enabled", back, "visible", GObject.BindingFlags.SYNC_CREATE)
+        header.pack_start(back)
+        self.leave = Gtk.Button(label="Выйти")
+        self.leave.connect("clicked", lambda *_a: self.sign_out())
+        self.refresh = Gtk.Button(label="⟳")
+        self.refresh.set_tooltip_text("Обновить")
+        self.refresh.connect("clicked", lambda *_a: self.load(0))
+        header.pack_end(self.leave)
+        header.pack_end(self.refresh)
+        window.set_titlebar(header)
+
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self.build_signin(), "signin")
+        self.stack.add_named(self.build_list(), "list")
+        self.stack.add_named(self.build_letter(), "letter")
+        self.stack.add_named(label("", xalign=0.5), "wait")
+        window.add(self.stack)
+        window.show_all()
+        self.show("wait")
+
+    def show(self, page):
+        self.stack.set_visible_child_name(page)
+        self.back.set_enabled(page == "letter")
+        self.leave.set_visible(page == "list")
+        self.refresh.set_visible(page == "list")
+        self.title.set_text({"list": NAMES[self.role], "letter": "Письмо"}.get(page, "Почта"))
+
+    def go_back(self):
+        if self.stack.get_visible_child_name() == "letter":
+            self.letter_uid = None
+            self.show("list")
+
+    # Signing in
+
+    def build_signin(self):
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        column.get_style_context().add_class("signin")
+        # Narrow enough for the tablet upright (800 px) with the margins.
+        column.set_size_request(640, -1)
+        column.set_halign(Gtk.Align.CENTER)
+        column.set_margin_top(32)
+        column.set_margin_bottom(32)
+        column.set_margin_start(24)
+        column.set_margin_end(24)
+
+        self.address = Gtk.Entry(input_purpose=Gtk.InputPurpose.EMAIL)
+        self.address.connect("changed", lambda *_a: self.domain_changed())
+        self.password = Gtk.Entry(input_purpose=Gtk.InputPurpose.PASSWORD, visibility=False)
+        self.password.connect("activate", lambda *_a: self.check())
+        self.server = Gtk.Entry()
+        self.server.set_placeholder_text("imap.example.org")
+        self.server_label = label("Сервер")
+        self.hint = label("", "hint", wrap=True)
+        self.hint.set_selectable(True)
+        self.check_btn = Gtk.Button(label="Проверить")
+        self.check_btn.get_style_context().add_class("suggested-action")
+        self.check_btn.connect("clicked", lambda *_a: self.check())
+        self.signin_status = label("", "status", wrap=True)
+
+        for widget in (label("Адрес почты"), self.address, label("Пароль приложения"),
+                       self.password, self.server_label, self.server, self.hint,
+                       self.check_btn, self.signin_status):
+            column.pack_start(widget, False, False, 0)
+        for widget in (self.server_label, self.server):
+            widget.set_no_show_all(True)
+        self.address.set_text(self.config.get("mail", "address", fallback=""))
+        self.domain_changed()
+
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(column)
+        return scroll
+
+    def domain_changed(self):
+        address = self.address.get_text()
+        known = servers.servers(address)
+        other = known is None and bool(servers.domain(address))
+        for widget in (self.server_label, self.server):
+            widget.set_visible(other)
+        if other and not self.server.get_text():
+            saved = self.config.get("mail", "imap", fallback="")
+            self.server.set_text(saved or servers.guess_field(address))
+        if known:
+            self.hint.set_text(known.hint)
+        else:
+            self.hint.set_text(servers.OTHER_HINT if other else
+                               "Почта пускает программы по паролю приложения: "
+                               "его создают в настройках безопасности почты.")
+
+    def check(self):
+        address = self.address.get_text().strip()
+        password = self.password.get_text().strip().replace(" ", "")
+        if not servers.domain(address):
+            self.signin_status.set_text("Введите адрес почты целиком, например ivan@yandex.ru.")
+            return
+        if not password:
+            self.signin_status.set_text("Введите пароль приложения.")
+            return
+        provider = servers.servers(address) or servers.from_field(self.server.get_text())
+        if provider is None:
+            self.signin_status.set_text("Укажите сервер, например imap.example.org.")
+            return
+        self.check_btn.set_sensitive(False)
+        self.signin_status.set_text("Проверяю…")
+        box = Mailbox(address, password, provider.imap, CACHE)
+
+        def work():
+            box.check()
+            self.vault.put(SECRET, password)
+            return box
+
+        def done(box):
+            self.check_btn.set_sensitive(True)
+            self.password.set_text("")
+            self.signin_status.set_text("")
+            section = self.config["mail"]
+            section["address"] = address
+            section["imap"] = "%s:%d" % provider.imap
+            section["smtp"] = "%s:%d" % provider.smtp
+            try:
+                write_config(self.config)
+            except OSError:
+                pass
+            self.opened(box)
+
+        def failed(e):
+            self.check_btn.set_sensitive(True)
+            self.signin_status.set_text(error_text(e))
+            box.close()
+
+        self.worker.do(work, done, failed)
+
+    def start(self):
+        """The saved mailbox, if the vault keeps its password; else signing in."""
+        section = self.config["mail"]
+        address, imap = section.get("address", ""), section.get("imap", "")
+        provider = servers.servers(address) or servers.from_field(imap)
+        if not address or provider is None:
+            self.show("signin")
+            return
+
+        def failed(e):
+            self.signin_status.set_text(error_text(e))
+            self.show("signin")
+
+        def done(password):
+            if not password:
+                self.show("signin")
+                return
+            self.opened(Mailbox(address, password, provider.imap, CACHE))
+
+        self.worker.do(lambda: self.vault.get(SECRET), done, failed)
+
+    def opened(self, box):
+        self.box = box
+        self.role = INBOX
+        self.folder_buttons[INBOX].set_active(True)
+        self.show("list")
+        self.load(0)
+
+    def sign_out(self):
+        address = self.box.address if self.box else ""
+        if not dialogs.ask(self.window, "Выйти из почты %s? Пароль приложения будет "
+                           "удалён, письма на сервере останутся." % address, "Выйти"):
+            return
+        box, self.box = self.box, None
+        self.gen += 1
+        self.clear_list()
+
+        def work():
+            if box is not None:
+                box.close()
+            self.vault.drop(SECRET)
+            safe = re.sub(r"[^\w.@-]", "_", address.lower())
+            if safe:
+                shutil.rmtree(os.path.join(CACHE, safe), ignore_errors=True)
+            shutil.rmtree(os.path.join(CACHE, "files"), ignore_errors=True)
+
+        self.worker.do(work, lambda _r: None,
+                       lambda e: dialogs.info(self.window, error_text(e)))
+        self.signin_status.set_text("")
+        self.show("signin")
+
+    # The list
+
+    def build_list(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        folders = Gtk.Box(spacing=0, homogeneous=True)
+        folders.get_style_context().add_class("folders")
+        folders.get_style_context().add_class("linked")
+        self.folder_buttons = {}
+        group = None
+        for role in (INBOX, SENT, TRASH):
+            button = Gtk.RadioButton.new_with_label_from_widget(group, NAMES[role])
+            button.set_mode(False)
+            button.connect("toggled", self.folder_toggled, role)
+            group = group or button
+            self.folder_buttons[role] = button
+            folders.pack_start(button, True, True, 0)
+        page.pack_start(folders, False, False, 0)
+        self.list_status = label("", "status", xalign=0.5, wrap=True)
+        self.list_status.set_no_show_all(True)
+        page.pack_start(self.list_status, False, False, 8)
+
+        self.rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.rows.connect("row-activated", lambda _l, row: self.open_letter(row))
+        self.placeholder = label("", "status", xalign=0.5)
+        self.placeholder.show()
+        self.rows.set_placeholder(self.placeholder)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        scroll.add(self.rows)
+        scroll.connect("edge-reached", self.edge_reached)
+        self.list_scroll = scroll
+        page.pack_start(scroll, True, True, 0)
+        return page
+
+    def folder_toggled(self, button, role):
+        if button.get_active() and role != self.role:
+            self.role = role
+            self.show("list")
+            self.load(0)
+
+    def clear_list(self):
+        for row in self.rows.get_children():
+            self.rows.remove(row)
+        self.loaded = self.total = 0
+
+    def set_status(self, text):
+        self.list_status.set_text(text)
+        self.list_status.set_visible(bool(text))
+
+    def load(self, start):
+        """The page from start on; start 0 reloads the folder (showing the
+        cached lines first)."""
+        if self.box is None or (self.loading and start):
+            return
+        box, role = self.box, self.role
+        if start == 0:
+            self.gen += 1
+            self.clear_list()
+            self.placeholder.set_text("Загружаю…")
+            self.set_status("")
+            gen = self.gen
+            self.worker.do(lambda: box.cached(role, PAGE),
+                           lambda lines: self.cached(gen, lines))
+        gen = self.gen
+        self.loading = True
+        self.worker.do(lambda: box.page(role, start, PAGE),
+                       lambda answer: self.loaded_page(gen, start, *answer),
+                       lambda e: self.load_failed(gen, e))
+
+    def cached(self, gen, lines):
+        if gen == self.gen and not self.rows.get_children():
+            for line in lines:
+                self.rows.add(Row(line))
+            self.rows.show_all()
+
+    def loaded_page(self, gen, start, lines, total):
+        if gen != self.gen:
+            return
+        self.loading = False
+        if start == 0:
+            self.clear_list()
+        for line in lines:
+            self.rows.add(Row(line))
+        self.rows.show_all()
+        self.loaded, self.total = start + len(lines), total
+        self.placeholder.set_text("Писем нет")
+        self.set_status("")
+
+    def load_failed(self, gen, e):
+        if gen != self.gen:
+            return
+        self.loading = False
+        if isinstance(e, LoginFailed):
+            self.box = None
+            self.signin_status.set_text(
+                "Почта больше не принимает пароль. Введите новый пароль приложения.")
+            self.show("signin")
+            return
+        self.placeholder.set_text("")
+        self.set_status(error_text(e) + " Нажмите «⟳», чтобы попробовать снова.")
+
+    def edge_reached(self, _scroll, position):
+        if position == Gtk.PositionType.BOTTOM and self.loaded < self.total:
+            self.load(self.loaded)
+
+    # A letter
+
+    def build_letter(self):
+        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(column, "set_margin_" + side)(24)
+        self.letter_subject = label("", "letter-subject", wrap=True)
+        self.letter_from = label("", "letter-head", wrap=True)
+        self.letter_when = label("", "letter-head")
+        self.files = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.files.get_style_context().add_class("files")
+        self.text = Gtk.TextView(editable=False, cursor_visible=False,
+                                 wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        self.text.get_style_context().add_class("letter-text")
+        self.text.set_top_margin(16)
+        self.text.set_bottom_margin(16)
+        buffer = self.text.get_buffer()
+        self.link_tag = buffer.create_tag("link", underline=Pango.Underline.SINGLE,
+                                          foreground="#1a5fb4")
+        self.text.connect("button-release-event", self.text_tapped)
+        self.trash_btn = Gtk.Button(label="В корзину")
+        self.trash_btn.get_style_context().add_class("trash")
+        self.trash_btn.set_halign(Gtk.Align.START)
+        self.trash_btn.connect("clicked", lambda *_a: self.to_trash())
+        for widget in (self.letter_subject, self.letter_from, self.letter_when, self.files,
+                       self.text):
+            column.pack_start(widget, False, False, 0)
+        column.pack_start(self.trash_btn, False, False, 16)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(column)
+        self.letter_scroll = scroll
+        return scroll
+
+    def open_letter(self, row):
+        uid, role, box = row.line.uid, self.role, self.box
+        if box is None:
+            return
+        self.letter_uid = uid
+        self.letter = None
+        self.letter_subject.set_text(row.line.subject)
+        self.letter_from.set_text(row.line.sender)
+        self.letter_when.set_text(nice_when(row.line.when, full=True))
+        for child in self.files.get_children():
+            self.files.remove(child)
+        self.text.get_buffer().set_text("Открываю…")
+        self.trash_btn.set_visible(False)
+        self.letter_scroll.get_vadjustment().set_value(0)
+        self.show("letter")
+
+        def done(letter):
+            row.set_unread(False)
+            if self.letter_uid == uid:
+                self.show_letter(letter, role)
+
+        def failed(e):
+            if self.letter_uid == uid:
+                self.text.get_buffer().set_text(error_text(e))
+
+        self.worker.do(lambda: box.read(role, uid), done, failed)
+
+    def show_letter(self, letter, role):
+        self.letter = letter
+        self.letter_subject.set_text(letter.subject)
+        head = letter.sender
+        if role == SENT and letter.to:
+            head = "Кому: " + letter.to
+        self.letter_from.set_text(head)
+        if letter.when:
+            self.letter_when.set_text(nice_when(letter.when, full=True))
+        for attachment in letter.attachments:
+            self.files.pack_start(self.file_row(attachment), False, False, 0)
+        self.files.show_all()
+        buffer = self.text.get_buffer()
+        buffer.set_text(letter.text or "(письмо без текста)")
+        for match in LINK.finditer(letter.text):
+            end = match.end() - len(match.group(0)) + len(match.group(0).rstrip(".,;:!?'"))
+            buffer.apply_tag(self.link_tag, buffer.get_iter_at_offset(match.start()),
+                             buffer.get_iter_at_offset(end))
+        self.trash_btn.set_visible(role != TRASH)
+
+    def text_tapped(self, view, event):
+        buffer = view.get_buffer()
+        if buffer.get_has_selection():
+            return False
+        x, y = view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(event.x), int(event.y))
+        found, where = view.get_iter_at_location(x, y)
+        if not found or not where.has_tag(self.link_tag):
+            return False
+        start, end = where.copy(), where.copy()
+        if not start.starts_tag(self.link_tag):
+            start.backward_to_tag_toggle(self.link_tag)
+        end.forward_to_tag_toggle(self.link_tag)
+        uri = buffer.get_text(start, end, False)
+        try:
+            Gtk.show_uri_on_window(self.window, uri, Gdk.CURRENT_TIME)
+        except GLib.Error:
+            dialogs.info(self.window, "Не удалось открыть ссылку.")
+        return False
+
+    def file_row(self, attachment):
+        row = Gtk.Box(spacing=12)
+        name = label("%s · %s" % (attachment.name, nice_size(attachment.size)),
+                     ellipsize=True)
+        name.set_hexpand(True)
+        row.pack_start(name, True, True, 0)
+        for title, action in (("Открыть", self.open_file), ("Сохранить", self.save_file),
+                              ("Отправить", self.send_file)):
+            button = Gtk.Button(label=title)
+            button.connect("clicked", lambda _b, act=action: act(attachment))
+            row.pack_start(button, False, False, 0)
+        return row
+
+    def temp_file(self, attachment):
+        """The attachment as a file of its own folder (only we can read it), so
+        attachments with the same name do not meet."""
+        folder = os.path.join(CACHE, "files")
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        folder = tempfile.mkdtemp(dir=folder)
+        path = os.path.join(folder, attachment.name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(attachment.data)
+        return path
+
+    def open_file(self, attachment):
+        try:
+            path = self.temp_file(attachment)
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
+        except (OSError, GLib.Error):
+            dialogs.info(self.window, "Нет программы, которая открывает такие файлы.")
+
+    def save_file(self, attachment):
+        folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) \
+            or GLib.get_home_dir()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = unique(folder, attachment.name)
+            with open(path, "xb") as f:
+                f.write(attachment.data)
+        except OSError:
+            dialogs.info(self.window, "Не удалось сохранить файл.")
+            return
+        dialogs.info(self.window, "Файл «%s» сохранён в папке «%s»."
+                     % (os.path.basename(path), os.path.basename(folder)))
+
+    def send_file(self, attachment):
+        try:
+            path = self.temp_file(attachment)
+        except OSError:
+            dialogs.info(self.window, "Не удалось подготовить файл.")
+            return
+        share.send(path, self.window)
+
+    def to_trash(self):
+        uid, role, box = self.letter_uid, self.role, self.box
+        if box is None or uid is None or role == TRASH:
+            return
+        self.trash_btn.set_sensitive(False)
+
+        def done(_result):
+            self.trash_btn.set_sensitive(True)
+            for row in self.rows.get_children():
+                if row.line.uid == uid:
+                    self.rows.remove(row)
+                    self.loaded -= 1
+                    self.total -= 1
+            if self.letter_uid == uid:
+                self.go_back()
+
+        def failed(e):
+            self.trash_btn.set_sensitive(True)
+            dialogs.info(self.window, error_text(e))
+
+        self.worker.do(lambda: box.trash(role, uid), done, failed)
+
+
+if __name__ == "__main__":
+    sys.exit(Mail().run(sys.argv))

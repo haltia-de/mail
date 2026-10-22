@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.haltia_de.Mail</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-2.0-or-later</project_license>
+  <name>Mail</name>
+  <name xml:lang="ru">Почта</name>
+  <summary>One mailbox, big letters</summary>
+  <summary xml:lang="ru">Один ящик, крупные письма</summary>
+  <description>
+    <p xml:lang="ru">Вход по адресу и паролю приложения, сервер выбирается по адресу; Входящие, Отправленные и Корзина; письмо простым текстом, вложения можно открыть, сохранить или отправить в другую программу.</p>
+    <p>Calm, touch-first and simple, part of the Haltia desktop; at home on any GTK desktop.</p>
+  </description>
+  <launchable type="desktop-id">io.github.haltia_de.Mail.desktop</launchable>
+  <url type="homepage">https://github.com/haltia-de/mail</url>
+  <developer id="io.github.haltia_de"><name>Mikhail Nevskiy</name></developer>
+  <content_rating type="oars-1.1"/>
+  <requires><control>touch</control></requires>
+  <releases>
+    <release version="0.1.0" date="2026-10-22">
+      <description>
+        <p>The first version: sign in with the address and an app password, read the inbox, the sent letters and the trash, open, save or send attachments.</p>
+        <p xml:lang="ru">Первая версия: вход по адресу и паролю приложения, Входящие, Отправленные и Корзина, вложения можно открыть, сохранить или отправить.</p>
+      </description>
+    </release>
+  </releases>
+</component>

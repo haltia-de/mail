@@ -42,7 +42,8 @@ running. Keep this contract: shell#58 (haltia-report) calls it.
 - `Send(s to, s subject, s body, as attachments) -> s`: `to` is «Кому»
   (addresses separated by commas); `attachments` are absolute paths of
   regular files, 20 MB together at most, copied at once (the caller may
-  delete its own after the answer). The answer:
+  delete its own after the answer). The answer comes at once, after the
+  letter is kept, not after SMTP:
   - `sent`: the letter went out now (a copy goes to «Отправленные»);
   - `queued`: it waits in «Исходящие» and goes when it can;
   - `not-configured`: no mailbox signed in; nothing is kept.

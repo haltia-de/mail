@@ -11,6 +11,7 @@ Categories=GTK;Network;Email;
 Keywords=mail;email;letters;почта;письма;
 MimeType=application/pdf;text/plain;text/csv;image/jpeg;image/png;image/gif;image/webp;audio/mpeg;audio/ogg;video/mp4;application/zip;application/gzip;application/x-compressed-tar;application/x-tar;application/x-xz;application/json;application/vnd.oasis.opendocument.text;application/vnd.oasis.opendocument.spreadsheet;application/msword;application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;
 StartupNotify=true
+StartupWMClass=io.github.haltia_de.Mail
 NoDisplay=true
 X-Haltia-Home=false
 X-Haltia-Share=true

@@ -28,18 +28,24 @@ for _dir in (HERE, os.path.join(os.path.dirname(HERE), "share", "haltia-mail")):
         break
 
 import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango
-
-from haltia_kit import dialogs, share
-from haltia_kit.vault import Locked, Vault
-from haltia_mail import servers, smtp
-from haltia_mail.outbox import Outbox, accept
-from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox
-from haltia_mail.letter import clean_name
+from gi.repository import GLib
 
 APP_ID = "io.github.haltia_de.Mail"
+# Under Wayland GTK 3 names the window by the program name: the program's
+# id, as its .desktop file is named, so a desktop or the Haltia shell finds it.
+GLib.set_prgname(APP_ID)
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402,F811
+
+from haltia_kit import dialogs, share  # noqa: E402
+from haltia_kit.vault import Locked, Vault  # noqa: E402
+from haltia_mail import servers, smtp  # noqa: E402
+from haltia_mail.outbox import Outbox, accept  # noqa: E402
+from haltia_mail.imap import INBOX, NAMES, SENT, TRASH, LoginFailed, Mailbox  # noqa: E402
+from haltia_mail.letter import clean_name  # noqa: E402
+
 ON_HALTIA = "Haltia" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
 PAGE = 50
 CONFIG = os.path.join(GLib.get_user_config_dir(), "haltia", "mail.conf")

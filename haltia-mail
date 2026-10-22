@@ -12,6 +12,7 @@ import queue
 import re
 import shutil
 import sys
+import tempfile
 import threading
 from datetime import datetime, timedelta
 
@@ -287,7 +288,8 @@ class Mail(Gtk.Application):
     def build_signin(self):
         column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         column.get_style_context().add_class("signin")
-        column.set_size_request(min(900, 1100), -1)
+        # Narrow enough for the tablet upright (800 px) with the margins.
+        column.set_size_request(640, -1)
         column.set_halign(Gtk.Align.CENTER)
         column.set_margin_top(32)
         column.set_margin_bottom(32)
@@ -648,10 +650,11 @@ class Mail(Gtk.Application):
         return row
 
     def temp_file(self, attachment):
-        """The attachment as a file of its own folder (only we can read it)."""
+        """The attachment as a file of its own folder (only we can read it), so
+        attachments with the same name do not meet."""
         folder = os.path.join(CACHE, "files")
         os.makedirs(folder, mode=0o700, exist_ok=True)
-        folder = GLib.Dir.make_tmp("XXXXXX") if False else _fresh_dir(folder)
+        folder = tempfile.mkdtemp(dir=folder)
         path = os.path.join(folder, attachment.name)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
@@ -708,12 +711,6 @@ class Mail(Gtk.Application):
             dialogs.info(self.window, error_text(e))
 
         self.worker.do(lambda: box.trash(role, uid), done, failed)
-
-
-def _fresh_dir(parent):
-    """A new folder under parent, so attachments with the same name do not meet."""
-    import tempfile
-    return tempfile.mkdtemp(dir=parent)
 
 
 if __name__ == "__main__":

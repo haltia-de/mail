@@ -46,6 +46,14 @@ class ReadTests(unittest.TestCase):
         got = read(letter(body=None, html="<p>Только <b>HTML</b></p>"))
         self.assertEqual(got.text, "Только HTML")
 
+    def test_long_attachment_name(self):
+        name = "Очень длинное имя файла " * 10 + ".pdf"
+        got = read(letter(attachments=[(name, "application/pdf", b"%PDF")]))
+        short = got.attachments[0].name
+        self.assertLessEqual(len(short.encode()), 200)
+        self.assertTrue(short.startswith("Очень длинное имя"))
+        self.assertTrue(short.endswith(".pdf"))
+
     def test_encoded_headers(self):
         raw = (b"From: =?utf-8?B?0JjQstCw0L0=?= <ivan@ya.ru>\r\n"
                b"Subject: =?koi8-r?B?8NLJ18XU?=\r\n"

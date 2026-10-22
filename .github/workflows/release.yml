@@ -1,0 +1,14 @@
+# The release (ADR 0002 in haltia-de/haltia): a vX.Y.Z tag builds the
+# signed Alpine package and puts it into the GitHub release.
+name: release
+on:
+  push:
+    tags: ["v*.*.*"]
+permissions:
+  contents: write
+jobs:
+  apk:
+    uses: haltia-de/ci/.github/workflows/apk.yml@v1
+    with:
+      arch: noarch
+    secrets: inherit

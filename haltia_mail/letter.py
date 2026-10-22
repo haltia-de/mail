@@ -159,7 +159,19 @@ def _attachment_name(part, number):
         extension = {"application/pdf": ".pdf", "image/jpeg": ".jpg",
                      "image/png": ".png", "text/plain": ".txt"}
         name = "вложение-%d%s" % (number, extension.get(part.get_content_type(), ""))
-    return name[:200]
+    return _shorten(name)
+
+
+def _shorten(name, limit=200):
+    """At most limit bytes of UTF-8 (file systems allow 255; « (2)» needs
+    room too), the extension kept."""
+    if len(name.encode()) <= limit:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    if not stem or len(ext.encode()) > 16:
+        stem, dot, ext = name, "", ""
+    room = limit - len((dot + ext).encode())
+    return stem.encode()[:room].decode("utf-8", "ignore").rstrip() + dot + ext
 
 
 def read(raw):

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Mail
+Name[ru]=Почта
+Comment=One mailbox, big letters
+Comment[ru]=Один ящик, крупные письма
+Exec=haltia-mail
+Icon=io.github.haltia_de.Mail
+Terminal=false
+Categories=GTK;Network;Email;
+Keywords=mail;email;letters;почта;письма;
+StartupNotify=true
+NoDisplay=true
+X-Haltia-Home=false

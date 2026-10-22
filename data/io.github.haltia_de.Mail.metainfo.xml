@@ -17,6 +17,12 @@
   <content_rating type="oars-1.1"/>
   <requires><control>touch</control></requires>
   <releases>
+    <release version="0.1.1" date="2026-10-22">
+      <description>
+        <p>Mail's window carries its id, so the shell recognises it.</p>
+        <p xml:lang="ru">Окно «Почты» называется по её идентификатору, и оболочка его узнаёт.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-22">
       <description>
         <p>The first version: a simple mail program, hidden for now: one mailbox by an app password; sends letters with attachments; a service other programs use to send letters, for example the helper's diagnostic reports.</p>

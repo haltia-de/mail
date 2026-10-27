@@ -12,15 +12,21 @@ Not thread-safe and blocking: the program calls it from one worker thread.
 
 import base64
 from datetime import datetime, timezone
-import imaplib
 import json
 import logging
 import os
 import re
-import ssl
 import time
 
 from . import letter
+
+
+def _imaplib():
+    """imaplib, imported in the mail worker the first time it is needed
+    (with ssl): not while the window starts."""
+    import imaplib
+
+    return imaplib
 
 INBOX, SENT, TRASH = "inbox", "sent", "trash"
 NAMES = {INBOX: "Входящие", SENT: "Отправленные", TRASH: "Корзина"}
@@ -173,7 +179,7 @@ def _internal(meta):
     if not match:
         return None
     try:
-        stamp = imaplib.Internaldate2tuple(b"* 1 (" + match.group(0) + b")")
+        stamp = _imaplib().Internaldate2tuple(b"* 1 (" + match.group(0) + b")")
     except Exception:
         return None
     if stamp is None:
@@ -242,6 +248,9 @@ class Mailbox:
 
     @staticmethod
     def _ssl(host, port):
+        import ssl
+
+        imaplib = _imaplib()
         return imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(),
                                  timeout=TIMEOUT)
 
@@ -253,7 +262,7 @@ class Mailbox:
         conn = self.connect(*self.server)
         try:
             conn.login(self.address, self.password)
-        except imaplib.IMAP4.error as e:
+        except _imaplib().IMAP4.error as e:
             try:
                 conn.shutdown()
             except Exception:
@@ -279,7 +288,7 @@ class Mailbox:
         fresh = self.conn is None
         try:
             return work(self._open())
-        except (imaplib.IMAP4.abort, OSError):
+        except (_imaplib().IMAP4.abort, OSError):
             self._drop()
             if fresh:
                 raise
@@ -297,7 +306,7 @@ class Mailbox:
     def _ok(answer):
         typ, data = answer
         if typ != "OK":
-            raise imaplib.IMAP4.error(b" ".join(d for d in data if isinstance(d, bytes))
+            raise _imaplib().IMAP4.error(b" ".join(d for d in data if isinstance(d, bytes))
                                       .decode("utf-8", "replace"))
         return data
 

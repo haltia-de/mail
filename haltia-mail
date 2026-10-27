@@ -449,7 +449,9 @@ class Mail(Gtk.Application):
         header.pack_end(self.write)
         window.set_titlebar(header)
 
-        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        # No crossfade: without a GPU GTK blends both pages on the CPU for
+        # every frame of it.
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.NONE)
         self.stack.add_named(self.build_signin(), "signin")
         self.stack.add_named(self.build_list(), "list")
         self.stack.add_named(self.build_letter(), "letter")
@@ -731,13 +733,36 @@ class Mail(Gtk.Application):
             return
         self.loading = False
         if start == 0:
-            self.clear_list()
-        for line in lines:
-            self.rows.add(Row(line))
-        self.rows.show_all()
+            self.replace_rows(lines)
+        else:
+            for line in lines:
+                self.rows.add(Row(line))
+            self.rows.show_all()
         self.loaded, self.total = start + len(lines), total
         self.placeholder.set_text("Писем нет")
         self.set_status("")
+
+    def replace_rows(self, lines):
+        """The folder's first page in place of what the cache showed: a row
+        whose letter looks the same is kept (its unread mark set), only new
+        ones are built, and the list is not touched when nothing changed."""
+        old = self.rows.get_children()
+        kept = {row.line.uid: row for row in old}
+        rows = []
+        for line in lines:
+            row = kept.pop(line.uid, None)
+            if row is None or row.line._replace(unread=line.unread) != line:
+                row = Row(line)
+            elif row.line.unread != line.unread:
+                row.set_unread(line.unread)
+            rows.append(row)
+        if rows == old:
+            return
+        for row in old:
+            self.rows.remove(row)
+        for row in rows:
+            self.rows.add(row)
+        self.rows.show_all()
 
     def load_failed(self, gen, e):
         if gen != self.gen:

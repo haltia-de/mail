@@ -9,8 +9,6 @@ Blocking: the program calls it off the GTK thread.
 """
 
 import mimetypes
-import smtplib
-import ssl
 from email import policy
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, getaddresses, make_msgid
@@ -66,6 +64,10 @@ def make(sender, to, subject, text, files=()):
 
 
 def _connect(host, port):
+    # smtplib and ssl in the worker that sends: not while the window starts.
+    import smtplib
+    import ssl
+
     context = ssl.create_default_context()
     if port == 465:
         return smtplib.SMTP_SSL(host, port, timeout=TIMEOUT, context=context)
@@ -84,6 +86,8 @@ def send(address, password, server, msg, connect=None):
 
     connect(host, port) -> an smtplib.SMTP with TLS already on (the tests
     give their own)."""
+    import smtplib
+
     raw = msg.as_bytes(policy=POLICY)
     to = recipients(msg["To"] or "")
     if not to:

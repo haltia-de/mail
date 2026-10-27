@@ -39,6 +39,27 @@ class MailboxTests(unittest.TestCase):
         with self.assertRaises(LoginFailed):
             self.box(password="wrong").check()
 
+    def test_failed_login_text_reaches_the_page_without_the_password(self):
+        secret = "super-secret-app-password"
+        with self.assertLogs("haltia_mail.imap", level="WARNING") as logs:
+            with self.assertRaises(LoginFailed) as caught:
+                self.box(password=secret).check()
+        text = imap.page_reply(caught.exception)
+        self.assertIn("AUTHENTICATIONFAILED", text)
+        self.assertIn("Invalid credentials", text)
+        self.assertNotIn(secret, text)
+        self.assertNotIn(secret, str(caught.exception))
+        logged = "\n".join(logs.output)
+        self.assertIn("AUTHENTICATIONFAILED", logged)
+        self.assertNotIn(secret, logged)
+        leaked = imap.reply_of(Exception("[AUTHENTICATIONFAILED] " + secret), secret)
+        self.assertNotIn(secret, leaked)
+        self.assertIn("AUTHENTICATIONFAILED", leaked)
+        mail = (HERE.parent / "haltia-mail").read_text(encoding="utf-8")
+        self.assertIn("page_reply", mail)
+        self.assertIn("server_reply", mail)
+        self.assertIn("log_line", mail)
+
     def test_special_use_folders(self):
         self.assertEqual(self.box().check(), {INBOX: "INBOX", SENT: "Sent", TRASH: "Trash"})
 

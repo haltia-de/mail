@@ -9,30 +9,29 @@ from collections import namedtuple
 # host and port of each; SMTP on 465 is SSL from the start, 587 is STARTTLS.
 Provider = namedtuple("Provider", "name imap smtp hint")
 
+# Under the sign-in form for every provider; extras name where the app
+# password is made and where IMAP is turned on.
+APP_HINT = ("Нужен пароль приложения, а не обычный пароль; в настройках "
+            "ящика должен быть включён доступ почтовым программам (IMAP).")
+
 YANDEX = Provider(
     "Яндекс", ("imap.yandex.ru", 993), ("smtp.yandex.ru", 465),
-    "Пароль приложения создаётся в Яндекс ID: «Безопасность» → «Пароли "
-    "приложений» → «Почта» (id.yandex.ru/security/app-passwords). В настройках "
-    "Почты, в разделе «Почтовые программы», должен быть включён доступ по IMAP.")
+    APP_HINT + " Яндекс ID → Безопасность → Пароли приложений → Почта; "
+    "Почта → Настройки → Почтовые программы: IMAP и пароли приложений")
 MAILRU = Provider(
     "Mail", ("imap.mail.ru", 993), ("smtp.mail.ru", 465),
-    "Пароль для внешнего приложения создаётся в настройках аккаунта Mail: "
-    "«Безопасность» → «Пароли для внешних приложений» "
-    "(account.mail.ru/user/2-step-auth/passwords).")
+    APP_HINT + " Mail: Безопасность → Пароли для внешних приложений "
+    "(account.mail.ru/user/2-step-auth/passwords)")
 GMAIL = Provider(
     "Gmail", ("imap.gmail.com", 993), ("smtp.gmail.com", 465),
-    "Пароль приложения создаётся в аккаунте Google на странице "
-    "myaccount.google.com/apppasswords; для этого нужна двухэтапная проверка.")
+    APP_HINT + " Google: аккаунт → Безопасность → Пароли приложений "
+    "(myaccount.google.com/apppasswords); нужна двухэтапная проверка")
 RAMBLER = Provider(
     "Рамблер", ("imap.rambler.ru", 993), ("smtp.rambler.ru", 465),
-    "В настройках Рамблер/почты, в разделе «Программы», включите «Доступ к "
-    "почтовому ящику с помощью почтовых клиентов»; там же создаётся пароль "
-    "для почтовой программы.")
+    APP_HINT)
 OUTLOOK = Provider(
     "Outlook", ("outlook.office365.com", 993), ("smtp-mail.outlook.com", 587),
-    "Пароль приложения создаётся в учётной записи Microsoft: «Безопасность» → "
-    "«Дополнительные параметры безопасности» → «Пароли приложений» "
-    "(account.microsoft.com/security); для этого нужна двухэтапная проверка.")
+    APP_HINT)
 
 DOMAINS = {}
 for _provider, _domains in (
@@ -44,8 +43,8 @@ for _provider, _domains in (
     for _domain in _domains.split():
         DOMAINS[_domain] = _provider
 
-OTHER_HINT = ("Укажите сервер IMAP своей почты, например imap.example.org. "
-              "Пароль приложения создаётся в настройках безопасности почты.")
+OTHER_HINT = (APP_HINT + " Укажите сервер IMAP своей почты, например "
+              "imap.example.org.")
 
 
 def domain(address):

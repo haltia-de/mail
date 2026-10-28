@@ -80,6 +80,15 @@ running. Keep this contract: shell#58 (haltia-report) calls it.
 - From a checkout: `python3 ./haltia-mail` (needs Python 3, PyGObject with
   GTK 3, and haltia-kit 2.3.0 or later).
 - Install: `sh install.sh [ROOT] [PREFIX]`, `/usr/local` by default.
+  It installs the script as the module
+  `PREFIX/share/haltia-mail/haltia_mail_main.py` (next to `haltia_mail/`),
+  with `PREFIX/bin/haltia-mail` a stub that runs it
+  (`runpy.run_module(..., run_name="__main__", alter_sys=False)`): Python
+  keeps no bytecode of the script it is started with, while a module loads
+  from its `__pycache__`, which the package compiles. `sys.argv`, the
+  `#!/usr/bin/env python3` and so the command line the shell matches
+  (`python3 PREFIX/bin/haltia-mail`) stay the script's; `__file__` is the
+  module's. The D-Bus service file runs the stub.
 
 ## Releases
 

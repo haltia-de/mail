@@ -14,10 +14,25 @@ prefix=${2:-/usr/local}
 here=$(cd "$(dirname "$0")" && pwd)
 share=$root$prefix/share
 id=io.github.haltia_de.Mail
-install -D -m 755 "$here/haltia-mail" "$root$prefix/bin/haltia-mail"
 for file in "$here"/haltia_mail/*.py; do
 	install -D -m 644 "$file" "$share/haltia-mail/haltia_mail/$(basename "$file")"
 done
+# The program runs from a module, which Python loads compiled (its
+# __pycache__, made by the package), while the script Python is started
+# with is compiled anew at every start. PREFIX/bin/haltia-mail is a stub that
+# runs the module as __main__ with sys.argv as given: the shell knows the
+# program by its command line, python3 PREFIX/bin/haltia-mail.
+install -D -m 644 "$here/haltia-mail" "$root$prefix/share/haltia-mail/haltia_mail_main.py"
+mkdir -p "$root$prefix/bin"
+cat > "$root$prefix/bin/haltia-mail" <<EOF
+#!/usr/bin/env python3
+# The code is $prefix/share/haltia-mail/haltia_mail_main.py, run from there so that Python loads it compiled.
+import runpy
+import sys
+sys.path.insert(0, "$prefix/share/haltia-mail")
+runpy.run_module("haltia_mail_main", run_name="__main__", alter_sys=False)
+EOF
+chmod 755 "$root$prefix/bin/haltia-mail"
 install -D -m 644 "$here/data/$id.desktop" "$share/applications/$id.desktop"
 install -D -m 644 "$here/data/$id.svg" "$share/icons/hicolor/scalable/apps/$id.svg"
 install -D -m 644 "$here/data/$id.metainfo.xml" "$share/metainfo/$id.metainfo.xml"

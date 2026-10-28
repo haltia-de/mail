@@ -17,6 +17,16 @@
   <content_rating type="oars-1.1"/>
   <requires><control>touch</control></requires>
   <releases>
+    <release version="0.2.1" date="2026-10-28">
+      <description>
+        <ul>
+          <li>The program starts faster: its code is loaded already compiled.</li>
+        </ul>
+        <ul>
+          <li xml:lang="ru">Программа запускается быстрее: её код загружается уже скомпилированным.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-28">
       <description>
         <ul>

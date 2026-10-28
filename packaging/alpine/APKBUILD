@@ -1,6 +1,6 @@
 # Maintainer: Mikhail Nevskiy <rensomail@gmail.com>
 pkgname=haltia-mail
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=0
 pkgdesc="Почта: one mailbox, big letters (GTK 3)"
 url="https://github.com/haltia-de/mail"

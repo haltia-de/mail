@@ -17,6 +17,20 @@
   <content_rating type="oars-1.1"/>
   <requires><control>touch</control></requires>
   <releases>
+    <release version="0.2.0" date="2026-10-28">
+      <description>
+        <ul>
+          <li>When signing in fails, Mail shows the mail server's reply and says where to make an app password for Yandex, Mail.ru and Gmail</li>
+          <li>Mail opens faster</li>
+          <li>When a folder is reloaded, letters that have not changed stay in place and the list does not flicker</li>
+        </ul>
+        <ul>
+          <li xml:lang="ru">Если войти не удалось, «Почта» показывает ответ почтового сервера и подсказывает, где сделать пароль приложения для Яндекса, Mail.ru и Gmail</li>
+          <li xml:lang="ru">«Почта» открывается быстрее</li>
+          <li xml:lang="ru">При обновлении папки письма, которые не изменились, остаются на месте, и список не мигает</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-22">
       <description>
         <p>Mail's window carries its id, so the shell recognises it.</p>

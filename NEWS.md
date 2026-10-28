@@ -1,5 +1,19 @@
 # Что нового · What's new
 
+## 0.2.0 (2026-10-28)
+
+### Русский
+
+- Если войти не удалось, «Почта» показывает ответ почтового сервера и подсказывает, где сделать пароль приложения для Яндекса, Mail.ru и Gmail
+- «Почта» открывается быстрее
+- При обновлении папки письма, которые не изменились, остаются на месте, и список не мигает
+
+### English
+
+- When signing in fails, Mail shows the mail server's reply and says where to make an app password for Yandex, Mail.ru and Gmail
+- Mail opens faster
+- When a folder is reloaded, letters that have not changed stay in place and the list does not flicker
+
 ## 0.1.1 (2026-10-22)
 
 ### Русский
